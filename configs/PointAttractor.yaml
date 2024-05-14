@@ -1,0 +1,45 @@
+data_params:
+  N: 32
+  cohs:
+  - -0.5
+  - 0.5
+  dataset: PointAttractor
+  dt: 0.05
+  ntrials: 10
+  obs_noise: 0.01
+  props:
+    test: 0.2
+    train: 0.6
+    validation: 0.2
+  seed: 6
+  seeds:
+    test: 0
+    train: 7
+    validation: 8
+  sigma: 0.1
+  time: 10
+model_params:
+  D: 2
+  kernel_A:
+  - normalizer: 1
+    scale: 1.0
+    sigma: 100.0
+    type: RBF
+  kernel_A_diag: 1.0e-05
+  kernel_L:
+  - normalizer: 1
+    scale: 0.01
+    sigma: 10.0
+    type: RBF
+  kernel_L_diag: 1.0e-05
+  kernel_b:
+  - normalizer: 1
+    scale: 0.01
+    sigma: 10.0
+    type: RBF
+  kernel_b_diag: 0.01
+  seed: 10
+optim_params:
+  gamma: 1
+  n_iter: 1000
+  step_size: 0.001

@@ -1,21 +1,19 @@
-# Estimating Noise Correlations in Neural Populations with Wishart Processes
+# Gaussian Process Linear Dynamical Systems
 
-![Estimating Noise Correlations in Neural Populations with Wishart Processes](https://github.com/neurostatslab/wishart-process/assets/5959554/1e49a585-3974-4abe-80cd-e79757e59d90)
+<!-- ![Gaussian Process Linear Dynamical Systems](https://github.com/neurostatslab/wishart-process/assets/5959554/1e49a585-3974-4abe-80cd-e79757e59d90) -->
 
-The signaling capacity of a neural population depends on the scale and orientation of its covariance across trials. Estimating this ''noise'' covariance is challenging---a recording of $N$ neurons has on the order of $N^2$ unknown parameters---and is thought to require a large number of stereotyped trials.
+Uncovering and comparing the dynamical mechanisms that support neural processing remains a key challenge in the analysis of biological and artificial neural systems. However, measures of representational (dis)similarity in neural systems often assume that neural responses are static in time. Here, we show that stochastic shape metrics (Duong et al., 2023), which were developed to compare noisy neural responses to static inputs and lack an explicit notion of temporal structure, are well equipped to compare noisy dynamics.
 
-This code package introduces a generative model based on Gaussian and Wishart processes and develops a mean field variational inference procedure for inferring neural means and covariances given a dataset consisting of condition variables and their corresponding multi-trial neural firing rates. 
+This code package introduces a generative model for smooth time-varying linear approximation of nonlinear dynamics. The model has separate accounts for input-driven activity, recurrent activity, and noise correlations.
+ 
 
-See **[our paper](https://openreview.net/forum?id=3ucmcMzCXD)** for further details:
+See **[our paper](https://openreview.net/forum?id=Fykvxdv2I8)** for further details:
 
 ```
-@inproceedings{
-      nejatbakhsh2023estimating,
-      title={Estimating Noise Correlations Across Continuous Conditions With Wishart Processes},
-      author={Amin Nejatbakhsh and Isabel Garon and Alex H Williams},
-      booktitle={Thirty-seventh Conference on Neural Information Processing Systems},
-      year={2023},
-      url={https://openreview.net/forum?id=3ucmcMzCXD}
+@inproceedings{lipshutz2024disentangling,
+  title={Disentangling Recurrent Neural Dynamics with Stochastic Representational Geometry},
+  author={Lipshutz, David and Nejatbakhsh, Amin and Williams, Alex H},
+  booktitle={ICLR 2024 Workshop on Representational Alignment}
 }
 ```
 
@@ -35,18 +33,18 @@ conda activate jaxenv
 
 3. Install [**JAX**](https://github.com/google/jax) package
 
-4. Install other requirements (matplotlib, scipy, sklearn, numpyro)
+4. Install other requirements (matplotlib, scipy, sklearn, numpyro, flax)
 
 5. Run either using the demo file or the run script via the following commands
 
 ```
-python run.py -c configs/GPWP.yaml -o ../results/
+python run.py -c configs/Saddle.yaml -o ../results/
 ```
 
 
 Since the code is preliminary, you will be able to use `git pull` to get updates as we release them.
 
-### Generative model, and sampling from it
+<!-- ### Generative model, and sampling from it
 
 We start by creating an instance of our prior and likelihood models.
 
@@ -153,4 +151,4 @@ Since we use GP and WP as underlying models it's very easy to sample means and c
 with numpyro.handlers.seed(rng_seed=seed):
     mu_test_hat, sigma_test_hat, F_test_hat = posterior.sample(x_test)
 ```
-
+ -->
