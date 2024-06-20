@@ -212,6 +212,94 @@ class GlobalLatent(VariationalLSTM):
     
 
 # %%
+class VariationalBasis:
+    def __init__(self,key,basis_dim,T,out_shape,basis_fn,scale=1e-2):
+        out_dim = reduce((lambda x, y: x * y), out_shape)
+        self.shape = (T-1,)+out_shape
+
+        self.mu_params = jnp.zeros((basis_dim,out_dim))
+        self.sg_params = jnp.zeros((basis_dim,out_dim))
+
+        self.fn_mu = lambda par, ts: scale*jnp.einsum('co,btc->bto',par,basis_fn(ts))
+        self.fn_sg = lambda par, ts: scale*jax.nn.softplus(jnp.einsum('co,btc->bto',par,basis_fn(ts)))
+        
+
+    def set_params(self, params):
+        self.mu_params, self.sg_params = params
+    @property
+    def params(self):
+        return (self.mu_params, self.sg_params)
+               
+    def f(self,key,y,ts,params):
+        vars_mu,vars_sg = params
+
+        mu = self.fn_mu(vars_mu,ts[:,None]).reshape(self.shape)
+        sg = self.fn_sg(vars_sg,ts[:,None]).reshape(self.shape)
+
+        sample = dist.Normal(mu,sg).sample(key)
+        lp = dist.Normal(mu,sg).log_prob(sample)
+
+        return sample,lp.sum()
+    
+    def posterior_mean(self,y,ts,params):
+        vars_mu = params[0]
+        mu = self.fn_mu(vars_mu,ts[:,None]).reshape(self.shape)
+        return mu
+    
+    def posterior_scale(self,y,ts,params):
+        vars_sg = params[1]
+        scale = self.fn_sg(vars_sg,ts[:,None]).reshape(self.shape)
+        return scale
+# %%
+class BasisZ:
+    def __init__(
+            self,key,D,T,basis_fn,basis_dim=1,
+            scale_A=1e0,scale_b=1e0,scale_L=1e-1,
+        ):
+        '''initialize an instance
+        '''        
+        self.D = D # dynamics dimension
+        self.T = T # time dimension
+
+        keys = jax.random.split(key,3)
+        
+        self.A = VariationalBasis(keys[0],basis_dim,T,(D,D),basis_fn,scale=scale_A)
+        self.b = VariationalBasis(keys[1],basis_dim,T,(D,1),basis_fn,scale=scale_b)
+        self.L = VariationalBasis(keys[2],basis_dim,T,(D,D),basis_fn,scale=scale_L)
+
+    def set_params(self,params):
+        self.A.set_params(params[:2])
+        self.b.set_params(params[2:4])
+        self.L.set_params(params[4:])
+    
+    @property
+    def params(self):
+        return self.A.params+self.b.params+self.L.params
+    
+    def f(self,key,y,ts,params):
+        # TODO: Fix this
+        keys = jax.random.split(key,3)
+        A,lpA =  self.A.f(keys[1],y,ts,params[:2])
+        b,lpb =  self.b.f(keys[2],y,ts,params[2:4])
+        L,lpL =  self.L.f(keys[3],y,ts,params[4:])
+        return (A,b[...,0],L),lpA+lpb+lpL
+
+    def posterior_mean(self,y,ts,params):
+        # TODO: Fix this
+        EA =  self.A.posterior_mean(y,ts,params[:2])
+        Eb =  self.b.posterior_mean(y,ts,params[2:4])
+        EL =  self.L.posterior_mean(y,ts,params[4:])
+        return (EA,Eb[...,0],EL)
+    
+    def posterior_scale(self,y,ts,params):
+        # TODO: Fix this
+        CA =  self.A.posterior_scale(y,ts,params[:2])
+        Cb =  self.b.posterior_scale(y,ts,params[2:4])
+        CL =  self.L.posterior_scale(y,ts,params[4:])
+        return (CA,Cb[...,0],CL)
+    
+
+# %%
 class AmortizedFFZ:
     def __init__(
             self,key,D,T,C=1,H=10,
@@ -238,6 +326,9 @@ class AmortizedFFZ:
         return self.A.params+self.b.params+self.L.params
     
     def f(self,key,y,ts,params):
+        # TODO: Fix this
+        # ts = jnp.stack((jnp.sin(ts),jnp.cos(ts))).T
+
         keys = jax.random.split(key,3)
         A,lpA =  self.A.f(keys[1],y,ts,params[:2])
         b,lpb =  self.b.f(keys[2],y,ts,params[2:4])
@@ -245,12 +336,18 @@ class AmortizedFFZ:
         return (A,b[...,0],L),lpA+lpb+lpL
 
     def posterior_mean(self,y,ts,params):
+        # TODO: Fix this
+        # ts = jnp.stack((jnp.sin(ts),jnp.cos(ts))).T
+
         EA =  self.A.posterior_mean(y,ts,params[:2])
         Eb =  self.b.posterior_mean(y,ts,params[2:4])
         EL =  self.L.posterior_mean(y,ts,params[4:])
         return (EA,Eb[...,0],EL)
     
     def posterior_scale(self,y,ts,params):
+        # TODO: Fix this
+        # ts = jnp.stack((jnp.sin(ts),jnp.cos(ts))).T
+
         CA =  self.A.posterior_scale(y,ts,params[:2])
         Cb =  self.b.posterior_scale(y,ts,params[2:4])
         CL =  self.L.posterior_scale(y,ts,params[4:])
@@ -260,14 +357,13 @@ class AmortizedFFZ:
 # %%
 class AmortizedZ:
     def __init__(
-            self,key,D,N,T,C=1,H=10,
+            self,key,D,T,C=1,H=10,
             scale_A=1e0,scale_b=1e0,scale_L=1e-1,
         ):
         '''initialize an instance
         '''        
         self.D = D # dynamics dimension
         self.T = T # time dimension
-        self.N = N # obs dim
 
         keys = jax.random.split(key,3)
         

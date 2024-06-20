@@ -353,3 +353,136 @@ def time_var_dynamics(
         plt.close('all')
     else:
         plt.show()
+
+
+# %%
+def flow_2d(
+        A,
+        means,
+        covs,
+        pc=None,
+        xlim=[-1,1],
+        ylim=[-1,1],
+        n_points=10,
+        titlestr='',
+        fontsize=15,
+        xlabel='$x^{(1)}$',
+        ylabel='$x^{(2)}$',
+        scale=1,
+        color=None,
+        legend=False,
+        dotsize=50,
+        linewidth=5,
+        std=3,
+        text=False,
+        lim=None,
+        save=False,
+        file=None
+    ):
+
+    # Create a grid of points
+    x = np.linspace(xlim[0], xlim[1], n_points)
+    y = np.linspace(ylim[0], ylim[1], n_points)
+    X, Y = np.meshgrid(x, y)
+
+    # Create a quiver plot
+    fig, ax = plt.subplots()
+    
+    Q = ax.quiver(
+        X, 
+        Y, 
+        np.zeros_like(X), 
+        np.zeros_like(Y), 
+        pivot='mid', 
+        scale=1
+    )
+    
+    plt.xlabel(xlabel,fontsize=fontsize)
+    plt.ylabel(ylabel,fontsize=fontsize)
+    plt.xticks(fontsize=fontsize)
+    plt.yticks(fontsize=fontsize)
+
+    plt.gca().xaxis.set_major_locator(plt.MaxNLocator(3))
+    plt.gca().yaxis.set_major_locator(plt.MaxNLocator(3))
+
+    plt.title(titlestr,fontsize=fontsize)
+
+    plt.xlim(xlim)
+    plt.ylim(ylim)
+    
+    plt.tight_layout()
+
+    matrix = scale*A@np.stack((X.flatten(),Y.flatten()))
+    Q.set_UVC(matrix[0], matrix[1])
+
+
+
+    ylorbr = cm.get_cmap('viridis', means.shape[0])
+    colors = ylorbr(np.linspace(0,1,means.shape[0]))
+
+    
+    plt.title(titlestr,fontsize=fontsize)
+
+
+    plt.plot(
+        np.mean(means,1)[:,0],np.mean(means,1)[:,1],
+        lw=linewidth,linestyle='dashed',color='k',alpha=.3
+    )
+
+    facecolors = colors.copy()
+    facecolors[:,-1] /= 10
+
+    for j in range(len(means)):
+        plt.scatter(
+            means[j][:,0],
+            means[j][:,1], 
+            s=dotsize,
+            marker='o',
+            c=colors[j] if color is None else color[j].repeat(3)
+        )
+        
+        draw_ellipse(
+            means[j].mean(0)[:2],covs[j][:2,:2],colors[j],ax=plt.gca(),
+            std_devs=std,facecolor=facecolors[j],linewidth=linewidth
+        )
+
+        if text: 
+            plt.text(means[j][:,0],means[j][:,1],str(j))
+
+
+    
+    if pc is not None:
+        plt.scatter(
+            pc[:,0],
+            pc[:,1],
+            s=dotsize/2,
+            marker='.',
+            c='k'
+        )
+
+
+    if legend: 
+        plt.legend(
+            fontsize=fontsize,
+            loc='center left',
+            bbox_to_anchor=(1, 0.5)
+        )
+    plt.grid(False)
+
+    plt.gca().xaxis.set_major_locator(plt.MaxNLocator(3))
+    plt.gca().yaxis.set_major_locator(plt.MaxNLocator(3))
+
+    plt.xticks(fontsize=fontsize)
+    plt.yticks(fontsize=fontsize)
+
+
+    if lim is not None:
+        plt.xlim(lim)
+        plt.ylim(lim)
+    
+    if save:
+        plt.savefig(file+'.png',format='png')
+        plt.savefig(file+'.pdf',format='pdf')
+        plt.close('all')
+    else:
+        plt.show()

@@ -242,20 +242,20 @@ class NormalConditionalLikelihood:
         return y
     
     def log_prob(self,stats,y,params):
-        # mu,scale_tril=stats,params[0]
-        mu,scale_tril=stats,self.scale_tril
+        mu,scale_tril=stats,params[0]
+        # mu,scale_tril=stats,self.scale_tril
         return dist.MultivariateNormal(
             mu,scale_tril=scale_tril
         ).log_prob(y)
     
     @property
     def params(self):
-        return ()
-        # return (self.scale_tril,)
+        # return ()
+        return (self.scale_tril,)
     
     def set_params(self,params):
-        pass
-        # self.scale_tril = params[0]
+        # pass
+        self.scale_tril = params[0]
 
 # %%
 class LinearEmission:
@@ -284,17 +284,17 @@ class LinearEmission:
             self.d = d
 
     def set_params(self, params):
-        pass
-        # self.C,self.D = params[0:2]
+        # pass
+        self.C,self.D = params[0:2]
         
     @property
     def params(self):
-        return ()
-        # return (self.C,self.d)
+        # return ()
+        return (self.C,self.d)
 
     def f(self,x,params):
-        C,d = self.C, self.d
-        # C,D = params[:2]
+        # C,d = self.C, self.d
+        C,d = params[:2]
         y = x@C.T + d[None]
         return y
 
