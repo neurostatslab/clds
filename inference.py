@@ -264,8 +264,8 @@ class BasisZ:
         keys = jax.random.split(key,3)
         
         self.A = VariationalBasis(keys[0],basis_dim,T,(D,D),basis_fn,scale=scale_A)
-        self.b = VariationalBasis(keys[1],basis_dim,T,(D,1),basis_fn,scale=scale_b)
-        self.L = VariationalBasis(keys[2],basis_dim,T,(D,D),basis_fn,scale=scale_L)
+        self.b = VariationalBasis(keys[1],basis_dim,T+1,(D,1),basis_fn,scale=scale_b)
+        self.L = VariationalBasis(keys[2],basis_dim,T+1,(D,D),basis_fn,scale=scale_L)
 
     def set_params(self,params):
         self.A.set_params(params[:2])
@@ -279,21 +279,21 @@ class BasisZ:
     def f(self,key,y,ts,params):
         # TODO: Fix this
         keys = jax.random.split(key,3)
-        A,lpA =  self.A.f(keys[1],y,ts,params[:2])
+        A,lpA =  self.A.f(keys[1],y,ts[1:],params[:2])
         b,lpb =  self.b.f(keys[2],y,ts,params[2:4])
         L,lpL =  self.L.f(keys[3],y,ts,params[4:])
         return (A,b[...,0],L),lpA+lpb+lpL
 
     def posterior_mean(self,y,ts,params):
         # TODO: Fix this
-        EA =  self.A.posterior_mean(y,ts,params[:2])
+        EA =  self.A.posterior_mean(y,ts[1:],params[:2])
         Eb =  self.b.posterior_mean(y,ts,params[2:4])
         EL =  self.L.posterior_mean(y,ts,params[4:])
         return (EA,Eb[...,0],EL)
     
     def posterior_scale(self,y,ts,params):
         # TODO: Fix this
-        CA =  self.A.posterior_scale(y,ts,params[:2])
+        CA =  self.A.posterior_scale(y,ts[1:],params[:2])
         Cb =  self.b.posterior_scale(y,ts,params[2:4])
         CL =  self.L.posterior_scale(y,ts,params[4:])
         return (CA,Cb[...,0],CL)
@@ -624,16 +624,22 @@ def map(
     params = get_params(opt_state)
 
     def marginal_ll(params,y,t):
+        
+        ld,le,ll = len(joint.dynamics.params), len(joint.emissions.params), len(joint.likelihood.params)
+        dynamics_params, emissions_params, likelihood_params = params[:ld], params[ld:ld+le], params[ld+le:ld+le+ll]
+        
+        z_params = params[ld+le+ll:]
 
         # Function for integrating out local latents (x)
         def scanned_func(carry,inputs):
             # Unpack carry from last iteration
             m_last, P_last = carry
 
-            # scale_tril_x = params[2]
-            # joint.dynamics.scale_tril
-            scale_tril_y = joint.likelihood.scale_tril
-            C = joint.emissions.C
+            
+            # scale_tril_y = joint.likelihood.scale_tril
+            scale_tril_y = likelihood_params[0]
+            C,d = emissions_params
+            # C = joint.emissions.C
             
             A,b,L,y = inputs
             
@@ -648,7 +654,7 @@ def map(
             # Compute log p(y[k] | y[1], ..., y[k-1]) using eq 4.19 in Sarkka
             
             S = C @ P_pred @ C.T + R
-            y_pred = C @ m_pred
+            y_pred = C @ m_pred + d
 
             log_prob_y = jax.scipy.stats.multivariate_normal.logpdf(y, y_pred, S)
 
@@ -662,27 +668,29 @@ def map(
             # Output log probability of y[t], conditioned on y[1], ..., y[t-1].
             return (m, P), log_prob_y
 
-        ld,lj = len(joint.dynamics.params), len(joint.params)
-        lds_params, z_params = params[:ld], params[lj:]
+
+        
+        # ld,lj = len(joint.dynamics.params), len(joint.params)
+        # lds_params, z_params = params[:ld], params[lj:]
         
         A0 = jnp.eye(D)[None]
         b0 = jnp.zeros((D))[None]
         L0 = jnp.zeros((D,D))[None]
         
         (A,b,L) = delta.posterior_mean(y,t,z_params)
-        # A,b,L = z_params
 
         A_ = jnp.concatenate((A0,A))
-        b_ = jnp.concatenate((b0,b))
-        L_ = jnp.concatenate((L0,L))
+        b_ = jnp.concatenate((b0,b[1:]))
+        L_ = jnp.concatenate((L0,L[1:]))
+
 
         log_marginal = jax.lax.scan(
                 scanned_func, 
-                (lds_params[0],lds_params[1]@lds_params[1].T),
+                (b[0],L[0]@L[0].T),
                 (A_,b_,L_,y)
             )[1].sum()
         
-        lpA = joint.gps['A'].log_prob(t,A)
+        lpA = joint.gps['A'].log_prob(t[1:],A)
         lpb = joint.gps['b'].log_prob(t,b)
         lpL = joint.gps['L'].log_prob(t,L)
 

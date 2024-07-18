@@ -63,10 +63,10 @@ true_joint = models.GPLDS(
     true_emission,
     true_likelihood
 )
-ts = jnp.arange(1,T).astype(float)
+ts = jnp.arange(0,T).astype(float)
 k1,key = jax.random.split(key,2)
 
-As = true_gps['A'].sample(k1,ts) + mean_A[:,:,None]
+As = true_gps['A'].sample(k1,ts[1:]) + mean_A[:,:,None]
 bs = true_gps['b'].sample(k1,ts)
 Ls = true_gps['L'].sample(k1,ts)
 
@@ -98,15 +98,43 @@ visualizations.plot_states([x[0],x[1]],['x','x'])
 visualizations.plot_states([y[0],y[1]],['y','y'])
 
 # %%
-k1,key = jax.random.split(key,2)
-recognition = inference.AmortizedRNN(key,D,N,T,H=50)
+# k1,key = jax.random.split(key,2)
+
+# %%
+C=15
+coeffs = jnp.array([
+    (a,b) for a in range(C) for b in range(C)
+])*jnp.pi*2
+
+basis_fn = \
+    lambda ts: jnp.concatenate((
+        jnp.sin(jnp.einsum('btk,ck->btc',ts,coeffs)),
+        jnp.cos(jnp.einsum('btk,ck->btc',ts,coeffs)),
+    ),axis=2)
+
+
+recognition = inference.BasisZ(
+    k1,
+    D,
+    T,
+    basis_fn=basis_fn,
+    basis_dim=coeffs.shape[0]*2,
+    scale_A=1e1,
+    scale_b=1e2,
+    scale_L=1e2
+)
 
 # %%
 k1,key = jax.random.split(key,2)
 
-loss = inference.infer(
-    k1,true_joint,recognition,y,ts,
-    n_iter=1000,step_size=.1,gamma=1
+loss = inference.map(
+    true_joint,
+    recognition,
+    y,
+    ts[:,1:],
+    n_iter=500,
+    step_size=1e-4,
+    gamma=1e-2
 )
 
 # %%

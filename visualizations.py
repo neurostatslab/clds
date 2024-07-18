@@ -288,6 +288,7 @@ def plot_signals(
 # %%
 def time_var_dynamics(
         A,
+        b=None,
         xlim=[-1,1],
         ylim=[-1,1],
         n_points=10,
@@ -301,8 +302,10 @@ def time_var_dynamics(
     ):
     # Function to update the quiver plot for each frame
     def update_quiver(num, Q, X, Y):
-        matrix = scale*A[num]@np.stack((X.flatten(),Y.flatten()))
-        Q.set_UVC(matrix[0], matrix[1])
+        matrix = A[num]@np.stack((X.flatten(),Y.flatten()))
+        if b is not None: matrix = matrix + b[num][:,None]
+        
+        Q.set_UVC(scale*matrix[0], scale*matrix[1])
         return Q,
 
     # Create a grid of points
@@ -344,7 +347,7 @@ def time_var_dynamics(
         update_quiver, 
         frames=A.shape[0], 
         fargs=(Q, X, Y), 
-        interval=50, 
+        interval=100, 
         blit=True
     )
 
