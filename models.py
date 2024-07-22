@@ -489,19 +489,37 @@ class wGPLDS():
         #     return __t3
 
         PhiAp_Exp = jnp.einsum('tk,tj->tkj', PhiAp, Exp).reshape(-1, len(self.wgps['A'].basis_funcs) * self.state_dim)
-        # print('E-step: PhiAp_Exp = {}'.format(PhiAp_Exp.sum()))
+        # # print('E-step: PhiAp_Exp = {}'.format(PhiAp_Exp.sum()))
         
-        # _t2 = jax.vmap(_outer)(PhiAp, Exp, Vxp).sum(0).reshape(len(self.wgps['A'].basis_funcs) * self.state_dim, len(self.wgps['A'].basis_funcs) * self.state_dim)        
-        PhiAp_Vxp = jnp.einsum('tk,tij->tkij', PhiAp, Vxp) #.reshape(-1, len(self.wgps['A'].basis_funcs) * self.state_dim, self.state_dim)
-        PhiAp_Vxp_PhiAp = jnp.einsum('tkij,tl->kijl', PhiAp_Vxp, PhiAp).reshape(len(self.wgps['A'].basis_funcs) * self.state_dim, len(self.wgps['A'].basis_funcs) * self.state_dim)
-        _t2 = PhiAp_Exp.T @ PhiAp_Exp + PhiAp_Vxp_PhiAp
+        # # _t2 = jax.vmap(_outer)(PhiAp, Exp, Vxp).sum(0).reshape(len(self.wgps['A'].basis_funcs) * self.state_dim, len(self.wgps['A'].basis_funcs) * self.state_dim)        
+        # PhiAp_Vxp = jnp.einsum('tk,tij->tkij', PhiAp, Vxp) #.reshape(-1, len(self.wgps['A'].basis_funcs) * self.state_dim, self.state_dim)
+        # PhiAp_Vxp_PhiAp = jnp.einsum('tkij,tl->kijl', PhiAp_Vxp, PhiAp).reshape(len(self.wgps['A'].basis_funcs) * self.state_dim, len(self.wgps['A'].basis_funcs) * self.state_dim)
+        # _t2 = PhiAp_Exp.T @ PhiAp_Exp + PhiAp_Vxp_PhiAp
         _t3 = jnp.einsum('tk,tij->kij', PhiAp, Expxn).reshape(len(self.wgps['A'].basis_funcs) * self.state_dim, self.state_dim) # X^T Y term
 
         # # # Parametrize _t2 directly in terms of its U U^T form, with U = PhiAp * (m + L)
-        # Lxp = jax.vmap(lambda _V: jnp.linalg.cholesky(_V))(Vxp)
+        # _t2 = jnp.zeros((len(self.wgps['A'].basis_funcs) * self.state_dim, len(self.wgps['A'].basis_funcs) * self.state_dim))
+        # for t in range(len(up)):
+        #     Lxp_t = jnp.linalg.cholesky(Vxp[t])
+        #     PhiAp_t = PhiAp[t]
+        #     PhiAp_Lxp_t = jnp.multiply(PhiAp_t[:, jnp.newaxis, jnp.newaxis], Lxp_t[jnp.newaxis, :, :])
+        #     _t2 += jnp.outer(PhiAp_Lxp_t, PhiAp_Lxp_t)
+
         # _PhiAp_Exp = jnp.einsum('tk,tj->tkj', PhiAp, Exp)
         # _PhiAp_Lxp = jnp.einsum('tk,tij->tkij', PhiAp, Lxp)#.reshape(len(inputs), -1)
-        # _t2 = jnp.einsum('tkj,tkl->jl', _PhiAp_Exp, _PhiAp_Exp) + jnp.einsum('tkij,tkil->jl', _PhiAp_Lxp, _PhiAp_Lxp
+        # _t2 = jnp.einsum('tki,tlj->kilj', _PhiAp_Exp, _PhiAp_Exp) + jnp.einsum('tkid,tldj->kilj', _PhiAp_Lxp, _PhiAp_Lxp)
+
+
+        _Z = jnp.einsum('tk,ti->tik', PhiAp, Exp)
+        _ZTZ = jnp.einsum('tki,tlj->kilj', _Z, _Z).reshape(len(self.wgps['A'].basis_funcs) * self.state_dim, len(self.wgps['A'].basis_funcs) * self.state_dim)
+        _Y = Exn - params.bs[:len(inputs)]
+        _ZTY = jnp.einsum('tki,tj->kij', _Z, _Y).reshape(len(self.wgps['A'].basis_funcs) * self.state_dim, self.state_dim)
+        # _PhiApb_Exp = _PhiAp_Exp + params.bs[:len(inputs)][:, None, :]
+        # # Lxp = jax.vmap(lambda _V: jnp.linalg.cholesky(_V))(Vxp)
+        # # _PhiAp_Lxp = jnp.einsum('tk,tij->tkij', PhiAp, Lxp)
+        # _t2 = jnp.einsum('tki,tlj->kilj', _PhiAp_Exp, _PhiAp_Exp) #+ \
+        #         # jnp.einsum('tkid,tljd->kilj', _PhiAp_Lxp, _PhiAp_Lxp)
+        # _t2 = _t2.reshape(len(self.wgps['A'].basis_funcs) * self.state_dim, len(self.wgps['A'].basis_funcs) * self.state_dim)
         # _t2 = PhiAp_Exp.T @ PhiAp_Exp + PhiAp_Lxp.T @ PhiAp_Lxp
         # _t2 = __t2 @ __t2.T
         
@@ -517,7 +535,7 @@ class wGPLDS():
         sum_yyT = emissions.T @ emissions
         emission_stats = (sum_xxT, sum_xyT, sum_yyT, num_timesteps)
 
-        return (init_stats, dynamics_stats, (PhiAp, PhiAp_Exp, Exp, Exn), (b_targets, b_regressors), (_t2, _t3), emission_stats), marginal_loglik
+        return (init_stats, dynamics_stats, (PhiAp, PhiAp_Exp, Exp, Exn), (b_targets, b_regressors), (_ZTZ, _ZTY), emission_stats), marginal_loglik
     
     def m_step(
             self,
@@ -536,7 +554,7 @@ class wGPLDS():
         # Sum the statistics across all batches
         # print(batch_stats[2][0].shape)
         stats = jax.tree_util.tree_map(partial(jnp.sum, axis=0), batch_stats)
-        init_stats, dynamics_stats, (PhiAp, PhiAp_Exp, Exp, Exn),  (b_targets, b_regressors),  (_t2, _t3), emission_stats = stats
+        init_stats, dynamics_stats, (PhiAp, PhiAp_Exp, Exp, Exn),  (b_targets, b_regressors),  (_ZTZ, _ZTY), emission_stats = stats
         # print('M-step: PhiAp_Exp = {}'.format(PhiAp_Exp.sum(0)))
 
         # Perform MLE estimation jointly
@@ -550,13 +568,15 @@ class wGPLDS():
         # PhiAp_Exp = jnp.einsum('tk,tj->tkj', PhiAp, Exp).reshape(-1, len(self.wgps['A'].basis_funcs) * self.state_dim)
         # W = jax.scipy.linalg.solve(PhiAp_Exp.T @ PhiAp_Exp + jnp.eye(PhiAp_Exp.shape[1]), PhiAp_Exp.T @ Exn).reshape(K_A, self.state_dim, self.state_dim)
 
-        # def is_symmetric(X):
-        #     return jnp.allclose(X, X.T)
-        # print(is_symmetric(_t2))
-        # print(is_symmetric(PhiAp_Exp.T @ PhiAp_Exp + jnp.eye(PhiAp_Exp.shape[1])))
-        W = jax.scipy.linalg.solve(_t2 + jnp.eye(_t2.shape[0]), _t3)
-        # W = W.reshape(K_A, self.state_dim, self.state_dim)
-        W = W.reshape(self.state_dim, K_A, self.state_dim).transpose(1, 0, 2)
+        def is_symmetric(X):
+            return jnp.allclose(X, X.T)
+
+        # W = jax.scipy.linalg.solve(_t2 + jnp.eye(_t2.shape[0]), _t3, assume_a='pos')
+        # # W = W.reshape(K_A, self.state_dim, self.state_dim)
+        # W = W.reshape(self.state_dim, K_A, self.state_dim).transpose(1, 0, 2)
+
+        W = jax.scipy.linalg.solve(_ZTZ + jnp.eye(K_A * self.state_dim), _ZTY, assume_a='pos')
+        W = W.reshape(self.state_dim, K_A, self.state_dim).transpose(1,2,0)
         # jax.debug.print('W = {}', W)
         # jax.debug.print('safe_wrap(W) = {}', safe_wrap(W))
 
