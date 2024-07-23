@@ -364,7 +364,10 @@ class WeightSpaceGaussianProcess():
         Returns:
             log_prob: Array, (D1, D2)
         '''
-        assert fs.shape[1] == self.D1 and fs.shape[2] == self.D2, 'Dimension mismatch'
+        if fs.ndim == 2:
+            assert (self.D1 == 1) ^ (self.D2 == 1), 'Incorrect dimensions'
+            fs = fs.reshape(-1, self.D1, self.D2)
+        assert fs.shape[1] == self.D1 and fs.shape[2] == self.D2, 'Incorrect dimensions'
         T = len(fs)
         Phi = self.evaluate_basis(xs) # T x K
         cov = jnp.dot(Phi, Phi.T)   # T x T
@@ -403,9 +406,12 @@ class wGPLDS():
         self.state_dim = state_dim
         self.emission_dim = emission_dim
 
-    def log_prior(self, params: ParamswGPLDS):
-        # return self.wgps['A'].log_prob(params.dynamics_gp_weights).sum()
-        raise NotImplementedError
+    def log_prior(self, params: ParamswGPLDS, inputs):
+        '''Compute the log prior of the parameters. Conditions are inputs'''
+        F = self.wgps['A'](params.dynamics_gp_weights, inputs)
+        logprior_A = self.wgps['A'].log_prob(inputs, F).sum()
+        logprior_b = self.wgps['b'].log_prob(inputs, params.bs).sum()
+        return logprior_A + logprior_b
 
     def weights_to_params(self, params, inputs):
         '''Transform weights of weight space into parameters. Implement as needed for all weight-space GP priors.'''
@@ -473,19 +479,38 @@ class wGPLDS():
         # Dynamics wGP sufficient stats
         # here assuming delta posterior around mean, hence a linear regression from the smoothed means, and missing the covariance terms
         PhiAp = self.wgps['A'].evaluate_basis(inputs)
-        _Z = jnp.einsum('tk,ti->tik', PhiAp, Exp)
-        _Y = Exn - params.bs[:len(inputs)]
-        _ZTZ = jnp.einsum('tik,tjl->ikjl', _Z, _Z).reshape(len(self.wgps['A'].basis_funcs) * self.wgps['A'].D2, len(self.wgps['A'].basis_funcs) * self.wgps['A'].D2)
-        _ZTY = jnp.einsum('tik,tj->ikj', _Z, _Y).reshape(len(self.wgps['A'].basis_funcs) * self.wgps['A'].D2, self.wgps['A'].D1)
-        wgpA_stats = (_ZTZ, _ZTY)
+        # _Z = jnp.einsum('tk,ti->tik', PhiAp, Exp)
+        # _Y = Exn - params.bs[:len(inputs)]
+        # _ZTZ = jnp.einsum('tik,tjl->ikjl', _Z, _Z).reshape(len(self.wgps['A'].basis_funcs) * self.wgps['A'].D2, len(self.wgps['A'].basis_funcs) * self.wgps['A'].D2)
+        # _ZTY = jnp.einsum('tik,tj->ikj', _Z, _Y).reshape(len(self.wgps['A'].basis_funcs) * self.wgps['A'].D2, self.wgps['A'].D1)
 
-        # Lxp = jax.vmap(lambda _V: jnp.linalg.cholesky(_V))(Vxp)
         # _ZV = jnp.einsum('tk,tij->tikj', PhiAp, Vxp)
         # # _ZLTZL = jnp.einsum('tikm,tmlj->ikjl', _ZL, _ZL).reshape(len(self.wgps['A'].basis_funcs) * self.wgps['A'].D2, len(self.wgps['A'].basis_funcs) * self.wgps['A'].D2)
         # _ZVTZV = jnp.einsum('tikj,tl->ikjl', _ZV, PhiAp).reshape(len(self.wgps['A'].basis_funcs) * self.wgps['A'].D2, len(self.wgps['A'].basis_funcs) * self.wgps['A'].D2)
         # _ZTZ += _ZVTZV
         # _Y = Expxn - jnp.einsum('ti,tj->tij', Exp, params.bs[:len(inputs)])
         # _ZTY = jnp.einsum('tk,tij->ikj', PhiAp, _Y).reshape(len(self.wgps['A'].basis_funcs) * self.wgps['A'].D2, self.wgps['A'].D1)
+
+        # Dynamics wGP sufficient stats
+        Expxn_b = Expxn - jnp.einsum('ti,tj->tij', Exp, params.bs[:len(inputs)])
+        sum_AExpxnT = jnp.einsum('tk,tij->ikj', PhiAp, Expxn_b)
+        
+        ExpxpT = jnp.einsum('ti,tj->tij', Exp, Exp) + Vxp
+        AExpxpT = jnp.einsum('tk,tij->tijk', PhiAp, ExpxpT)
+        sum_AExpxpTAT = jnp.einsum('tijk,tl->ikjl', AExpxpT, PhiAp)
+        
+        sum_AExpxnT = sum_AExpxnT.reshape(len(self.wgps['A'].basis_funcs) * self.wgps['A'].D2, self.wgps['A'].D1)
+        sum_AExpxpTAT = sum_AExpxpTAT.reshape(len(self.wgps['A'].basis_funcs) * self.wgps['A'].D2, len(self.wgps['A'].basis_funcs) * self.wgps['A'].D2)
+        wgpA_stats = (sum_AExpxpTAT, sum_AExpxnT)
+       
+        # Lxp = jax.vmap(lambda _V: jnp.linalg.cholesky(_V))(Vxp)
+        # _ZL = jnp.einsum('tk,tij->tijk', PhiAp, Lxp) # Each Lxp is a matrix of shape D1 x D2
+        # _ZLTZL = jnp.einsum('timk,tjml->ikjl', _ZL, _ZL).reshape(len(self.wgps['A'].basis_funcs) * self.wgps['A'].D2, len(self.wgps['A'].basis_funcs) * self.wgps['A'].D2)
+        # _ZTZ += _ZLTZL
+        
+        # _Ys = Expxn - jnp.einsum('ti,tj->tij', Exp, params.bs[:len(inputs)])
+        # _ZTY = jnp.einsum('timk,tjm->ikj', _Z, _Ys).reshape(len(self.wgps['A'].basis_funcs) * self.wgps['A'].D2, self.wgps['A'].D1) #! Z should be Phi(m + L)
+        # wgpA_stats = (_ZTZ, _ZTY)
 
         # Q sufficient stats
         # Vxn, Vxp = Vx[1:], Vx[:-1]
@@ -587,17 +612,18 @@ class wGPLDS():
         def em_step(params):
             # Obtain current E-step stats and joint log prob
             batch_stats, lls = vmap(partial(self.e_step, params))(emissions, inputs)
-            mll = lls.sum() #! add log_prior term
+            log_prior = self.log_prior(params, inputs[0])
+            lp = log_prior + lls.sum()
 
             # Update with M-step
             params = self.m_step(params, batch_stats, inputs[0])
-            return params, mll
+            return params, lp
 
         log_probs = []
         for i in range(num_iters):
-            params, marginal_log_lik = em_step(params)
-            log_probs.append(marginal_log_lik)
-            print(f'Iter {i+1}/{num_iters}, marginal log-likelihood = {marginal_log_lik:.2f}')
+            params, log_prob = em_step(params)
+            log_probs.append(log_prob)
+            print(f'Iter {i+1}/{num_iters}, log-prob = {log_prob:.2f}')
         return params, jnp.array(log_probs)
 
 # %%
