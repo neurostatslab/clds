@@ -574,8 +574,8 @@ class wGPLDS():
         # # Fix all others to the true values
         # Q = 0.01 * jnp.eye(self.state_dim)
         # R = 0.01 * jnp.eye(self.emission_dim)
-        m = jnp.zeros(self.state_dim)
-        S = jnp.eye(self.state_dim)
+        # m = jnp.zeros(self.state_dim)
+        # S = jnp.eye(self.state_dim)
         # bs = jnp.ones((len(inputs), self.state_dim))
 
         params = ParamswGPLDS(
