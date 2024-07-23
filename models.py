@@ -507,8 +507,9 @@ class wGPLDS():
         Phib = self.wgps['b'].evaluate_basis(inputs)
         _Zb = Phib.reshape(len(Exn), self.wgps['b'].D2, len(self.wgps['b'].basis_funcs) )
         _Yb = Exn - jax.vmap(lambda _F, _m: _F @ _m)(F, Exp)
-        _ZbTZb = jnp.einsum('tki,tlj->kilj', _Zb, _Zb).reshape(len(self.wgps['b'].basis_funcs) * self.wgps['b'].D2, len(self.wgps['b'].basis_funcs) * self.wgps['b'].D2)
-        _ZbTYb = jnp.einsum('tki,tj->kij', _Zb, _Yb).reshape(len(self.wgps['b'].basis_funcs) * self.wgps['b'].D2, self.wgps['b'].D1)
+        _ZbTZb = jnp.einsum('tik,tjl->ikjl', _Zb, _Zb).reshape(len(self.wgps['b'].basis_funcs) * self.wgps['b'].D2, len(self.wgps['b'].basis_funcs) * self.wgps['b'].D2)
+        _ZbTYb = jnp.einsum('tik,tj->ikj', _Zb, _Yb).reshape(len(self.wgps['b'].basis_funcs) * self.wgps['b'].D2, self.wgps['b'].D1)
+        wgpb_stats = (_ZbTZb, _ZbTYb)
 
         # more expected sufficient statistics for the emissions
         y = emissions
@@ -517,7 +518,7 @@ class wGPLDS():
         sum_yyT = emissions.T @ emissions
         emission_stats = (sum_xxT, sum_xyT, sum_yyT, num_timesteps)
 
-        return (init_stats, dynamics_stats, wgpA_stats, (_ZbTZb, _ZbTYb, Exn, Exp), emission_stats), marginal_loglik
+        return (init_stats, dynamics_stats, wgpA_stats, wgpb_stats, emission_stats), marginal_loglik
     
     def m_step(
             self,
@@ -542,7 +543,7 @@ class wGPLDS():
 
         # Sum the statistics across all batches
         stats = jax.tree_util.tree_map(partial(jnp.sum, axis=0), batch_stats)
-        init_stats, dynamics_stats, wgpA_stats, (_ZbTZb, _ZbTYb, Exn, Exp), emission_stats = stats
+        init_stats, dynamics_stats, wgpA_stats, wgpb_stats, emission_stats = stats
 
         # Perform MLE estimation jointly
         sum_x0, sum_x0x0T, N = init_stats
@@ -561,20 +562,20 @@ class wGPLDS():
         F_static, Q = fit_linear_regression(*dynamics_stats)
 
         # Bias update in weight space
-        bs_target = Exn/init_stats[-1] - jnp.einsum('tij,tj->ti', F, Exp/init_stats[-1])
-        # _, bs_reconstructed = fit_gplinear_regression(_ZbTZb, _ZbTYb, self.wgps['b'])
-        bs = bs_target.squeeze()
+        # bs_target = Exn/init_stats[-1] - jnp.einsum('tij,tj->ti', F, Exp/init_stats[-1])
+        _, bs_reconstructed = fit_gplinear_regression(*wgpb_stats, self.wgps['b'])
+        bs = bs_reconstructed.squeeze()
 
         # Emission M-step
         H, R = fit_linear_regression(*emission_stats)
+        H = jxr.normal(jxr.PRNGKey(0), shape=(self.emission_dim, self.state_dim))
         Cs = jnp.tile(H, (len(inputs)+1, 1, 1)) # Repeat the same emission matrix for all time steps
 
         # # Fix all others to the true values
-        # H = jxr.normal(jxr.PRNGKey(0), shape=(n_neurons, latent_dim))
         # Q = 0.01 * jnp.eye(self.state_dim)
         # R = 0.01 * jnp.eye(self.emission_dim)
-        # m = jnp.zeros(self.state_dim)
-        # S = jnp.eye(self.state_dim)
+        m = jnp.zeros(self.state_dim)
+        S = jnp.eye(self.state_dim)
         # bs = jnp.ones((len(inputs), self.state_dim))
 
         params = ParamswGPLDS(
