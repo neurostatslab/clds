@@ -559,7 +559,7 @@ class wGPLDS():
 
         # Perform MLE estimation jointly
         sum_x0, sum_x0x0T, N = init_stats
-        S = (sum_x0x0T - jnp.outer(sum_x0, sum_x0)) / N
+        S = sum_x0x0T / N - jnp.outer(sum_x0, sum_x0) / (N**2) # changed to N**2 because of outer.
         m = sum_x0 / N
 
         # Dynamics M-step
@@ -576,7 +576,7 @@ class wGPLDS():
         # W = W.reshape(self.state_dim, K_A, self.state_dim).transpose(1, 0, 2)
 
         W = jax.scipy.linalg.solve(_ZTZ + jnp.eye(K_A * self.state_dim), _ZTY, assume_a='pos')
-        W = W.reshape(self.state_dim, K_A, self.state_dim).transpose(1,2,0)
+        W = W.reshape(self.wgps['A'].D2, len(self.wgps['A'].basis_funcs), self.wgps['A'].D1).transpose(1,2,0)
         # jax.debug.print('W = {}', W)
         # jax.debug.print('safe_wrap(W) = {}', safe_wrap(W))
 
@@ -610,8 +610,9 @@ class wGPLDS():
         # Bias update in weight space
         # b_targets = Exn - jnp.einsum('tij,tj->ti', F, Exp) # shape (T, state_dim)
         # b_regressors = self.wgps['b'].evaluate_basis(inputs[:-1]) # shape (T, len_basis)
-        # b_weights = jax.scipy.linalg.solve(b_regressors.T @ b_regressors + jnp.eye(b_regressors.shape[1]), b_regressors.T @ b_targets).reshape(len(self.wgps['b'].basis_funcs), self.state_dim, 1)
-        # bs = jnp.einsum('tk,kj->tj', b_regressors, b_weights)
+        # b_weights = jax.scipy.linalg.solve(b_regressors.T @ b_regressors + jnp.eye(b_regressors.shape[1]), b_regressors.T @ b_targets)
+        # b_weights = b_weights.reshape(self.wgps['b'].D2, len(self.wgps['b'].basis_funcs), self.wgps['b'].D1).transpose(1,2,0)
+        # # bs = jnp.einsum('tk,kj->tj', b_regressors, b_weights)
         # bs = self.wgps['b'](b_weights, inputs).squeeze()
 
         # bs = jnp.tile(b, (Exn.shape[0], 1))
@@ -628,8 +629,8 @@ class wGPLDS():
         # H = jxr.normal(jxr.PRNGKey(0), shape=(n_neurons, latent_dim))
         Q = 0.1 * jnp.eye(self.state_dim)
         R = 0.1 * jnp.eye(self.emission_dim)
-        m = jnp.zeros(self.state_dim)
-        S = jnp.eye(self.state_dim)
+        # m = jnp.zeros(self.state_dim)
+        # S = jnp.eye(self.state_dim)
         bs = jnp.ones((len(inputs), self.state_dim))
         # B = jnp.zeros((self.state_dim, self.input_dim))
         # d = jnp.zeros(self.emission_dim)
@@ -656,7 +657,7 @@ class wGPLDS():
         ):
         assert emissions.ndim == 3, 'emissions should be 3D'
 
-        # @jit
+        @jit
         def em_step(params):
             # Obtain current E-step stats and joint log prob
             batch_stats, lls = vmap(partial(self.e_step, params))(emissions, inputs)
@@ -670,7 +671,7 @@ class wGPLDS():
         for i in range(num_iters):
             params, marginal_log_lik = em_step(params)
             log_probs.append(marginal_log_lik)
-            print(f'Iter {i+1}/{num_iters}, marginal log-likelihood = {marginal_log_lik}')
+            print(f'Iter {i+1}/{num_iters}, marginal log-likelihood = {marginal_log_lik:.2f}')
         return params, jnp.array(log_probs)
 
 # %%
