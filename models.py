@@ -445,7 +445,6 @@ class wGPLDS():
             inputs = jnp.zeros((num_timesteps, 1))
 
         # Run the smoother to get posterior expectations
-        # jax.debug.print('params = {}', params)
         marginal_loglik, filter_results, smoother_results = self.smoother(params, emissions, inputs)
         smoothed_means, smoothed_covariances, smoothed_cross_covariances = smoother_results
 
@@ -477,21 +476,14 @@ class wGPLDS():
         dynamics_stats = (sum_xpxpT, sum_xpxnT, sum_xnxnT, num_timesteps - 1)
 
         # Dynamics wGP sufficient stats
-        # here assuming delta posterior around mean, hence a linear regression from the smoothed means, and missing the covariance terms
         PhiAp = self.wgps['A'].evaluate_basis(inputs)
+        # partial E-step: assuming delta posterior around mean, hence a lin reg from the smoothed means only
         # _Z = jnp.einsum('tk,ti->tik', PhiAp, Exp)
         # _Y = Exn - params.bs[:len(inputs)]
         # _ZTZ = jnp.einsum('tik,tjl->ikjl', _Z, _Z).reshape(len(self.wgps['A'].basis_funcs) * self.wgps['A'].D2, len(self.wgps['A'].basis_funcs) * self.wgps['A'].D2)
         # _ZTY = jnp.einsum('tik,tj->ikj', _Z, _Y).reshape(len(self.wgps['A'].basis_funcs) * self.wgps['A'].D2, self.wgps['A'].D1)
 
-        # _ZV = jnp.einsum('tk,tij->tikj', PhiAp, Vxp)
-        # # _ZLTZL = jnp.einsum('tikm,tmlj->ikjl', _ZL, _ZL).reshape(len(self.wgps['A'].basis_funcs) * self.wgps['A'].D2, len(self.wgps['A'].basis_funcs) * self.wgps['A'].D2)
-        # _ZVTZV = jnp.einsum('tikj,tl->ikjl', _ZV, PhiAp).reshape(len(self.wgps['A'].basis_funcs) * self.wgps['A'].D2, len(self.wgps['A'].basis_funcs) * self.wgps['A'].D2)
-        # _ZTZ += _ZVTZV
-        # _Y = Expxn - jnp.einsum('ti,tj->tij', Exp, params.bs[:len(inputs)])
-        # _ZTY = jnp.einsum('tk,tij->ikj', PhiAp, _Y).reshape(len(self.wgps['A'].basis_funcs) * self.wgps['A'].D2, self.wgps['A'].D1)
-
-        # Dynamics wGP sufficient stats
+        # full E-step sufficient stats
         Expxn_b = Expxn - jnp.einsum('ti,tj->tij', Exp, params.bs[:len(inputs)])
         sum_AExpxnT = jnp.einsum('tk,tij->ikj', PhiAp, Expxn_b)
         
@@ -502,15 +494,6 @@ class wGPLDS():
         sum_AExpxnT = sum_AExpxnT.reshape(len(self.wgps['A'].basis_funcs) * self.wgps['A'].D2, self.wgps['A'].D1)
         sum_AExpxpTAT = sum_AExpxpTAT.reshape(len(self.wgps['A'].basis_funcs) * self.wgps['A'].D2, len(self.wgps['A'].basis_funcs) * self.wgps['A'].D2)
         wgpA_stats = (sum_AExpxpTAT, sum_AExpxnT)
-       
-        # Lxp = jax.vmap(lambda _V: jnp.linalg.cholesky(_V))(Vxp)
-        # _ZL = jnp.einsum('tk,tij->tijk', PhiAp, Lxp) # Each Lxp is a matrix of shape D1 x D2
-        # _ZLTZL = jnp.einsum('timk,tjml->ikjl', _ZL, _ZL).reshape(len(self.wgps['A'].basis_funcs) * self.wgps['A'].D2, len(self.wgps['A'].basis_funcs) * self.wgps['A'].D2)
-        # _ZTZ += _ZLTZL
-        
-        # _Ys = Expxn - jnp.einsum('ti,tj->tij', Exp, params.bs[:len(inputs)])
-        # _ZTY = jnp.einsum('timk,tjm->ikj', _Z, _Ys).reshape(len(self.wgps['A'].basis_funcs) * self.wgps['A'].D2, self.wgps['A'].D1) #! Z should be Phi(m + L)
-        # wgpA_stats = (_ZTZ, _ZTY)
 
         # Q sufficient stats
         # Vxn, Vxp = Vx[1:], Vx[:-1]
