@@ -511,9 +511,9 @@ class wGPLDS():
 
 
         _Z = jnp.einsum('tk,ti->tik', PhiAp, Exp)
-        _ZTZ = jnp.einsum('tki,tlj->kilj', _Z, _Z).reshape(len(self.wgps['A'].basis_funcs) * self.state_dim, len(self.wgps['A'].basis_funcs) * self.state_dim)
+        _ZTZ = jnp.einsum('tki,tlj->kilj', _Z, _Z).reshape(len(self.wgps['A'].basis_funcs) * self.wgps['A'].D2, len(self.wgps['A'].basis_funcs) * self.wgps['A'].D2)
         _Y = Exn - params.bs[:len(inputs)]
-        _ZTY = jnp.einsum('tki,tj->kij', _Z, _Y).reshape(len(self.wgps['A'].basis_funcs) * self.state_dim, self.state_dim)
+        _ZTY = jnp.einsum('tki,tj->kij', _Z, _Y).reshape(len(self.wgps['A'].basis_funcs) * self.wgps['A'].D2, self.wgps['A'].D1)
         # _PhiApb_Exp = _PhiAp_Exp + params.bs[:len(inputs)][:, None, :]
         # # Lxp = jax.vmap(lambda _V: jnp.linalg.cholesky(_V))(Vxp)
         # # _PhiAp_Lxp = jnp.einsum('tk,tij->tkij', PhiAp, Lxp)
@@ -522,11 +522,25 @@ class wGPLDS():
         # _t2 = _t2.reshape(len(self.wgps['A'].basis_funcs) * self.state_dim, len(self.wgps['A'].basis_funcs) * self.state_dim)
         # _t2 = PhiAp_Exp.T @ PhiAp_Exp + PhiAp_Lxp.T @ PhiAp_Lxp
         # _t2 = __t2 @ __t2.T
+
+        # # Q sufficient stats
+        # Vxn, Vxp = Vx[1:], Vx[:-1]
+        # sum_AExpxnT = jnp.einsum('tij,tjk->ik', F, Expxn) #.sum(0)
+        # sum_AExpxpAT = jax.vmap(lambda _m, _S, _A: _A @ (_m @ _m.T + _S) @ _A.T)(Exp, Vxp, F).sum(0)
+        # Q = (sum_xnxnT - _A_ExpxnT - _A_ExpxnT.T + _A_ExpxpT_A) / (dynamics_stats[-1] - 1) #! Need to check As to match A_t x_{t-1}
         
         # bias sufficient stats
         F = self.wgps['A'](params.dynamics_gp_weights, inputs)
-        b_targets = Exn - jnp.einsum('tij,tj->ti', F, Exp) # shape (T-1, state_dim)
-        b_regressors = self.wgps['b'].evaluate_basis(inputs) # shape (T-1, len_basis)
+        # b_targets = Exn - jnp.einsum('tij,tj->ti', F, Exp) # shape (T-1, state_dim)
+        # bp = self.wgps['b'].evaluate_basis(inputs) # shape (T-1, len_basis)
+        # bpTbp = bp.T @ bp
+        # bpTby = bp.T @ b_targets
+
+        Phib = self.wgps['b'].evaluate_basis(inputs)
+        _Zb = Phib.reshape(len(Exn), self.wgps['b'].D2, len(self.wgps['b'].basis_funcs) )
+        _Yb = Exn - jax.vmap(lambda _F, _m: _F @ _m)(F, Exp)
+        _ZbTZb = jnp.einsum('tki,tlj->kilj', _Zb, _Zb).reshape(len(self.wgps['b'].basis_funcs) * self.wgps['b'].D2, len(self.wgps['b'].basis_funcs) * self.wgps['b'].D2)
+        _ZbTYb = jnp.einsum('tki,tj->kij', _Zb, _Yb).reshape(len(self.wgps['b'].basis_funcs) * self.wgps['b'].D2, self.wgps['b'].D1)
 
         # more expected sufficient statistics for the emissions
         y = emissions
@@ -535,7 +549,7 @@ class wGPLDS():
         sum_yyT = emissions.T @ emissions
         emission_stats = (sum_xxT, sum_xyT, sum_yyT, num_timesteps)
 
-        return (init_stats, dynamics_stats, (PhiAp, PhiAp_Exp, Exp, Exn), (b_targets, b_regressors), (_ZTZ, _ZTY), emission_stats), marginal_loglik
+        return (init_stats, dynamics_stats, (PhiAp, PhiAp_Exp, Exp, Exn, Vx, Expxn), (_ZbTZb, _ZbTYb), (_ZTZ, _ZTY), emission_stats), marginal_loglik
     
     def m_step(
             self,
@@ -548,13 +562,21 @@ class wGPLDS():
             W = utils.psd_solve(ExxT, ExyT).T
             Sigma = (EyyT - W @ ExyT - ExyT.T @ W.T + W @ ExxT @ W.T) / N
             return W, Sigma
-        
+
+        def fit_gplinear_regression(ZTZ, ZTY, wgp_prior):
+            # Solve a linear regression in weight-space given sufficient statistics
+            weights = jax.scipy.linalg.solve(_ZTZ + jnp.eye(len(wgp_prior.basis_funcs) * wgp_prior.D2), _ZTY, assume_a='pos')
+            weights = weights.reshape(wgp_prior.D2, len(wgp_prior.basis_funcs), wgp_prior.D1).transpose(1,2,0)
+            
+            # Evaluate the weighted basis functions to obtain the parameters
+            vals = wgp_prior(weights, inputs)
+            return weights, vals
+
         K_A = len(self.wgps['A'].basis_funcs)
 
         # Sum the statistics across all batches
-        # print(batch_stats[2][0].shape)
         stats = jax.tree_util.tree_map(partial(jnp.sum, axis=0), batch_stats)
-        init_stats, dynamics_stats, (PhiAp, PhiAp_Exp, Exp, Exn),  (b_targets, b_regressors),  (_ZTZ, _ZTY), emission_stats = stats
+        init_stats, dynamics_stats, (PhiAp, PhiAp_Exp, Exp, Exn, Vx, Expxn),  (_ZbTZb, _ZbTYb),  (_ZTZ, _ZTY), emission_stats = stats
         # print('M-step: PhiAp_Exp = {}'.format(PhiAp_Exp.sum(0)))
 
         # Perform MLE estimation jointly
@@ -568,17 +590,19 @@ class wGPLDS():
         # PhiAp_Exp = jnp.einsum('tk,tj->tkj', PhiAp, Exp).reshape(-1, len(self.wgps['A'].basis_funcs) * self.state_dim)
         # W = jax.scipy.linalg.solve(PhiAp_Exp.T @ PhiAp_Exp + jnp.eye(PhiAp_Exp.shape[1]), PhiAp_Exp.T @ Exn).reshape(K_A, self.state_dim, self.state_dim)
 
-        def is_symmetric(X):
-            return jnp.allclose(X, X.T)
+        # def is_symmetric(X):
+        #     return jnp.allclose(X, X.T)
 
         # W = jax.scipy.linalg.solve(_t2 + jnp.eye(_t2.shape[0]), _t3, assume_a='pos')
         # # W = W.reshape(K_A, self.state_dim, self.state_dim)
         # W = W.reshape(self.state_dim, K_A, self.state_dim).transpose(1, 0, 2)
 
-        W = jax.scipy.linalg.solve(_ZTZ + jnp.eye(K_A * self.state_dim), _ZTY, assume_a='pos')
-        W = W.reshape(self.wgps['A'].D2, len(self.wgps['A'].basis_funcs), self.wgps['A'].D1).transpose(1,2,0)
-        # jax.debug.print('W = {}', W)
-        # jax.debug.print('safe_wrap(W) = {}', safe_wrap(W))
+        # W = jax.scipy.linalg.solve(_ZTZ + jnp.eye(len(self.wgps['A'].basis_funcs) * self.wgps['A'].D2), _ZTY, assume_a='pos')
+        # W = W.reshape(self.wgps['A'].D2, len(self.wgps['A'].basis_funcs), self.wgps['A'].D1).transpose(1,2,0)
+        # # jax.debug.print('W = {}', W)
+        # # jax.debug.print('safe_wrap(W) = {}', safe_wrap(W))
+        # F = self.wgps['A'](W, inputs)
+        W, F = fit_gplinear_regression(_ZTZ, _ZTY, self.wgps['A'])
 
         # len_basis = len(self.wgps['A'].basis_funcs)
         # _Phi = self.wgps['A'].evaluate_basis(inputs).T
@@ -587,34 +611,30 @@ class wGPLDS():
         # _Y = Exn
         # W = jax.scipy.linalg.solve(_X.T @ _X + jnp.eye(_X.T.shape[0]), _X.T @ _Y).reshape(K_A, self.state_dim, self.state_dim)
 
-        F = self.wgps['A'](W, inputs)
         # jax.debug.print('F = {}', F)
         # jax.debug.print('F = {}', F)
         # F = jnp.einsum('tk, kji->tij', PhiAp, W)
         # jax.debug.print('F dets: {}', [jnp.linalg.det(_F).item() for _F in F])
 
         # Vxn, Vxp = Vx[1:], Vx[:-1]
-        # Exp = Ex[:-1]
-        # Fp = F[:-1]
         # _ExnxnT = Exn.T @ Exn + Vxn.sum(0) # Unchanged
-        # _A_ExpxnT = jnp.einsum('tij,tjk->ik', Fp, Expxn) #.sum(0)
-        # _A_ExpxpT_A = jax.vmap(lambda _m, _S, _A: _A @ (_m @ _m.T + _S) @ _A.T)(Exp, Vxp, Fp).sum(0)
-        # Q = (_ExnxnT - _A_ExpxnT - _A_ExpxnT.T + _A_ExpxpT_A) / (num_timesteps - 1) #! Need to check As to match A_t x_{t-1}
+        # _A_ExpxnT = jnp.einsum('tij,tjk->ik', F, Expxn) #.sum(0)
+        # _A_ExpxpT_A = jax.vmap(lambda _m, _S, _A: _A @ (_m @ _m.T + _S) @ _A.T)(Exp, Vxp, F).sum(0)
+        # Q = (_ExnxnT - _A_ExpxnT - _A_ExpxnT.T + _A_ExpxpT_A) / (dynamics_stats[-1] - 1) #! Need to check As to match A_t x_{t-1}
 
         # F_static = FB[:, :self.state_dim]
         # b = Exn.mean(0) - F.mean(0) @ Exp.mean(0)
-        # bs = Exn - jnp.einsum('tij,tj->ti', F, Exp) 
-        F_static, Q = fit_linear_regression(*dynamics_stats)
+        _, Q = fit_linear_regression(*dynamics_stats)
         # F = jnp.tile(F_static, (Exn.shape[0], 1, 1))
 
         # Bias update in weight space
-        # b_targets = Exn - jnp.einsum('tij,tj->ti', F, Exp) # shape (T, state_dim)
-        # b_regressors = self.wgps['b'].evaluate_basis(inputs[:-1]) # shape (T, len_basis)
-        # b_weights = jax.scipy.linalg.solve(b_regressors.T @ b_regressors + jnp.eye(b_regressors.shape[1]), b_regressors.T @ b_targets)
-        # b_weights = b_weights.reshape(self.wgps['b'].D2, len(self.wgps['b'].basis_funcs), self.wgps['b'].D1).transpose(1,2,0)
-        # # bs = jnp.einsum('tk,kj->tj', b_regressors, b_weights)
-        # bs = self.wgps['b'](b_weights, inputs).squeeze()
+        bs_target = Exn/init_stats[-1] - jnp.einsum('tij,tj->ti', F, Exp/init_stats[-1]) 
+        b_weights = jax.scipy.linalg.solve(_ZbTZb + jnp.eye(len(self.wgps['b'].basis_funcs) * self.wgps['b'].D2), _ZbTYb, assume_a='pos')
+        b_weights = b_weights.reshape(self.wgps['b'].D2, len(self.wgps['b'].basis_funcs), self.wgps['b'].D1).transpose(1,2,0)
+        bs_reconstructed = self.wgps['b'](b_weights, inputs).squeeze()
+        bs = bs_reconstructed
 
+        # jax.debug.print('b error = {}', jnp.linalg.norm(bs_target - bs_reconstructed, ord=1))
         # bs = jnp.tile(b, (Exn.shape[0], 1))
         # jax.debug.print('bs = {}', bs)
         # jax.debug.print('expected bias = {}', Exn.mean(0) - F.mean(0) @ Exp.mean(0))
@@ -627,11 +647,11 @@ class wGPLDS():
 
         # # Fix all others to the true values
         # H = jxr.normal(jxr.PRNGKey(0), shape=(n_neurons, latent_dim))
-        Q = 0.1 * jnp.eye(self.state_dim)
-        R = 0.1 * jnp.eye(self.emission_dim)
+        # Q = 0.01 * jnp.eye(self.state_dim)
+        # R = 0.01 * jnp.eye(self.emission_dim)
         # m = jnp.zeros(self.state_dim)
         # S = jnp.eye(self.state_dim)
-        bs = jnp.ones((len(inputs), self.state_dim))
+        # bs = jnp.ones((len(inputs), self.state_dim))
         # B = jnp.zeros((self.state_dim, self.input_dim))
         # d = jnp.zeros(self.emission_dim)
         # D = jnp.zeros((self.emission_dim, self.input_dim))
