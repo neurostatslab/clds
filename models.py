@@ -399,10 +399,10 @@ class wGPLDS():
     def log_prior(self, params: ParamswGPLDS, inputs):
         '''Compute the log prior of the parameters. Conditions are inputs'''
         F = self.wgps['A'](params.dynamics_gp_weights, inputs)
-        logprior_A = self.wgps['A'].log_prob(inputs, F).sum()
+        logprior_A = self.wgps['A'].log_prob(inputs[:len(F)], F).sum()
 
         if self.wgps['b'] is not None:
-            logprior_b = self.wgps['b'].log_prob(inputs, params.bs).sum()
+            logprior_b = self.wgps['b'].log_prob(inputs[:len(params.bs)], params.bs).sum()
         else:
             logprior_b = 0.
         return logprior_A + logprior_b
@@ -430,19 +430,20 @@ class wGPLDS():
         self,
         params: ParamswGPLDS,
         emissions: Float[Array, "num_timesteps emission_dim"],
-        inputs: Optional[Float[Array, "num_timesteps-1 input_dim"]]=None,
+        inputs: Optional[Float[Array, "num_timesteps input_dim"]]=None,
     ):
         def weightspace_stats(
                 XTX: Float[Array, 'T D2 D2'], 
                 XTY: Float[Array, 'T D2 D1'], 
                 wgp_prior: WeightSpaceGaussianProcess,
+                conditions: Float[Array, "T condition_dim"]
                 ) -> tuple:
             '''
             Compute the expected sufficient statistics for the weight-space GP prior. 
             Provide the sufficient stats X^T X and X^T Y for the problem Y = AX + noise.
             This returns the expanded stats Phi @ X^T X @ Phi^T and Phi @ X^T Y for the basis functions Phi.
             '''
-            _Phi = wgp_prior.evaluate_basis(inputs)
+            _Phi = wgp_prior.evaluate_basis(conditions)
 
             ZTZ = jnp.einsum('tk,tij,tl->ikjl', _Phi, XTX, _Phi)
             ZTY = jnp.einsum('tk,tim->ikm', _Phi, XTY)
@@ -472,7 +473,7 @@ class wGPLDS():
         
         # Append bias to the inputs
         # inputs = jnp.concatenate((inputs, jnp.ones((num_timesteps, 1))), axis=1)
-        # up = inputs[:-1]
+        up = inputs[:-1]
         # u = inputs
 
         # expected sufficient statistics for the initial distribution
@@ -497,9 +498,9 @@ class wGPLDS():
         # _ZTY = jnp.einsum('tik,tj->ikj', _Z, _Y).reshape(len(self.wgps['A'].basis_funcs) * self.wgps['A'].D2, self.wgps['A'].D1)
 
         # full E-step sufficient stats
-        Expxn_b = Expxn - jnp.einsum('ti,tj->tij', Exp, params.bs[:len(inputs)])
+        Expxn_b = Expxn - jnp.einsum('ti,tj->tij', Exp, params.bs[:len(up)])
         ExpxpT = jnp.einsum('ti,tj->tij', Exp, Exp) + Vxp
-        wgpA_stats = weightspace_stats(ExpxpT, Expxn_b, self.wgps['A'])
+        wgpA_stats = weightspace_stats(ExpxpT, Expxn_b, self.wgps['A'], up)
 
         # Q sufficient stats
         # Vxn, Vxp = Vx[1:], Vx[:-1]
@@ -508,15 +509,15 @@ class wGPLDS():
         # Q = (sum_xnxnT - _A_ExpxnT - _A_ExpxnT.T + _A_ExpxpT_A) / (dynamics_stats[-1] - 1) #! Need to check As to match A_t x_{t-1}
         
         # bias sufficient stats
-        F = self.wgps['A'](params.dynamics_gp_weights, inputs)
+        F = self.wgps['A'](params.dynamics_gp_weights, up)
 
         bias_targets = Exn - jnp.einsum('tij,tj->ti', F, Exp)
         if self.wgps['b'] is None:
             bias_stats = (bias_targets, 1)
         else:
-            bias_targets = bias_targets.reshape(len(inputs), 1, self.state_dim)
-            _XTXb = jnp.ones((len(inputs), 1, 1))
-            bias_stats = weightspace_stats(_XTXb, bias_targets, self.wgps['b'])
+            bias_targets = bias_targets.reshape(len(up), 1, self.state_dim)
+            _XTXb = jnp.ones((len(up), 1, 1))
+            bias_stats = weightspace_stats(_XTXb, bias_targets, self.wgps['b'], up)
 
         # more expected sufficient statistics for the emissions
         y = emissions
@@ -525,13 +526,17 @@ class wGPLDS():
         sum_yyT = emissions.T @ emissions
         emission_stats = (sum_xxT, sum_xyT, sum_yyT, num_timesteps)
 
+        _xxT = jnp.einsum('ti,tj->tij', Ex, Ex) + Vx
+        _xyT = jnp.einsum('ti,tj->tij', Ex, y)
+        # wgpC_stats = weightspace_stats(_xxT, _xyT, self.wgps['C'], inputs)
+
         return (init_stats, dynamics_stats, wgpA_stats, bias_stats, emission_stats), marginal_loglik
     
     def m_step(
             self,
             params: ParamswGPLDS,
             batch_stats: Tuple,
-            inputs: Optional[Float[Array, "num_timesteps-1 input_dim"]]=None,
+            inputs: Optional[Float[Array, "num_timesteps input_dim"]]=None,
         ) -> ParamswGPLDS:
         def fit_linear_regression(ExxT, ExyT, EyyT, N):
             # Solve a linear regression given sufficient statistics
@@ -539,7 +544,7 @@ class wGPLDS():
             Sigma = (EyyT - W @ ExyT - ExyT.T @ W.T + W @ ExxT @ W.T) / N
             return W, Sigma
 
-        def fit_gplinear_regression(ZTZ, ZTY, wgp_prior):
+        def fit_gplinear_regression(ZTZ, ZTY, wgp_prior, conditions):
             # Solve a linear regression in weight-space given sufficient statistics
             weights = jax.scipy.linalg.solve(
                 ZTZ + jnp.eye(len(wgp_prior.basis_funcs) * wgp_prior.D2), ZTY, 
@@ -548,8 +553,10 @@ class wGPLDS():
             weights = weights.reshape(wgp_prior.D2, len(wgp_prior.basis_funcs), wgp_prior.D1).transpose(1,2,0)
 
             # Evaluate the weighted basis functions to obtain the parameters
-            vals = wgp_prior(weights, inputs)
+            vals = wgp_prior(weights, conditions)
             return weights, vals
+
+        up = inputs[:-1]
 
         # Sum the statistics across all batches
         stats = jax.tree_util.tree_map(partial(jnp.sum, axis=0), batch_stats)
@@ -561,7 +568,7 @@ class wGPLDS():
         m = sum_x0 / N
 
         # Dynamics M-step
-        W, F = fit_gplinear_regression(*wgpA_stats, self.wgps['A'])
+        W, F = fit_gplinear_regression(*wgpA_stats, self.wgps['A'], up)
 
         # Vxn, Vxp = Vx[1:], Vx[:-1]
         # _ExnxnT = Exn.T @ Exn + Vxn.sum(0) # Unchanged
@@ -577,16 +584,16 @@ class wGPLDS():
             bs = bias_stats[0]/bias_stats[1]
         else: 
             # In weight space
-            _, bs_reconstructed = fit_gplinear_regression(*bias_stats, self.wgps['b'])
+            _, bs_reconstructed = fit_gplinear_regression(*bias_stats, self.wgps['b'], up)
             bs = bs_reconstructed.squeeze()
         # The following for homogeneous bias
         # b = jnp.mean(bs, axis=0)
-        # bs = jnp.tile(b, (len(inputs), 1))
+        # bs = jnp.tile(b, (len(up), 1))
 
         # Emission M-step
         H, R = fit_linear_regression(*emission_stats)
         H = jxr.normal(jxr.PRNGKey(0), shape=(self.emission_dim, self.state_dim))
-        Cs = jnp.tile(H, (len(inputs)+1, 1, 1)) # Repeat the same emission matrix for all time steps
+        Cs = jnp.tile(H, (len(inputs), 1, 1)) # Repeat the same emission matrix for all time steps
 
         params = ParamswGPLDS(
             m0=m, S0=S, dynamics_gp_weights=W, bs=bs, Q=Q, Cs=Cs, R=R,
