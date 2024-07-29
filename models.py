@@ -331,38 +331,35 @@ class WeightSpaceGaussianProcess():
 
     def __call__(self, 
             weights: Float[Array, "len_basis D1 D2"], 
-            xs: Float[Array, "T"]
+            xs: Float[Array, "M T"]
         ) -> Float[Array, "T D1 D2"]:
         '''
-        Evaluate A_ij(x) = \sum_k w^{(ij)} \phi_k(x) at the points `xs`
+        Evaluate A_ij(x) = \sum_k w^{(ij)} \phi_k(x) at the M-dimensional points `xs`
         with `weights` w^{(ij)} and basis functions \phi_k.
         '''
         PhiX = self.evaluate_basis(xs)
-        # print(weights, PhiX)
         return jnp.einsum('kij,tk->tij', weights, PhiX)
     
     def weights(self, key: jxr.PRNGKey) -> Float[Array, "len_basis D1 D2"]:
-        '''retrieve weights associated with key'''
+        '''
+        retrieve weights associated with key
+        '''
         return jxr.normal(key, shape=(len(self.basis_funcs), self.D1, self.D2))
     
-    def evaluate_basis(self, x: Float[Array, "T"]) -> Float[Array, "T len_basis"]:
-        '''Evaluate the basis functions at the array x'''
-        return jnp.array([f(x) for f in self.basis_funcs]).T
+    def evaluate_basis(self, x: Float[Array, "T M"]) -> Float[Array, "T len_basis"]:
+        return jnp.array([jax.vmap(f)(x) for f in self.basis_funcs]).T
 
-    def sample(self, key: jxr.PRNGKey, xs: Float[Array, "T"]) -> Float[Array, "T D1 D2"]:
-        '''Sample from the GP prior at the points `xs`'''
+    def sample(self, key: jxr.PRNGKey, xs: Float[Array, "T M"]) -> Float[Array, "T D1 D2"]:
+        '''
+        Sample from the GP prior at the points `xs`
+        '''
         weights = self.weights(key)
         PhiX = self.evaluate_basis(xs)
         return self.__call__(weights, xs)
     
-    def log_prob(self, xs: Float[Array, "T"], fs: Float[Array, "T D1 D2"]) -> Float[Array, "D1 D2"]:
+    def log_prob(self, xs: Float[Array, "T M"], fs: Float[Array, "T D1 D2"]) -> Float[Array, "D1 D2"]:
         '''
         Compute the log probability of the GP draws at the time points ts
-        Args:
-            ts: Array, (T,)
-            fs: Array, (T, D1, D2)
-        Returns:
-            log_prob: Array, (D1, D2)
         '''
         if fs.ndim == 2:
             assert (self.D1 == 1) ^ (self.D2 == 1), 'Incorrect dimensions'
@@ -384,25 +381,18 @@ class ParamswGPLDS(NamedTuple):
     Cs: Float[Array, "num_timesteps emission_dim state_dim"]
     R: Float[Array, "emission_dim emission_dim"]
 
-# params = ParamswGPLDS(
-#     m0=jnp.array([0.0, 0.0]),
-#     S0=jnp.eye(2),
-#     dynamics_gp_weights=jnp.zeros((2, 2, 2)),
-#     bs=jnp.zeros((3, 2)),
-#     Q=jnp.eye(2),
-#     Cs=jnp.zeros((3, 2, 2)),
-#     R=jnp.eye(2),
-# )
-# print(params.dynamics_gp_weights)
-
 # %%
 class wGPLDS():
     '''
     GPLDS with weight-space view parametrization of the parameter priors
     '''
-    def __init__(self, wgps, state_dim: int, emission_dim: int):
+    def __init__(self, wgps: dict, state_dim: int, emission_dim: int):
         #! Add other dynamics and emission models if we want to sample from it
         self.wgps = wgps
+        assert 'A' in self.wgps, 'Dynamics GP prior is required'
+        if 'b' not in self.wgps:
+            self.wgps['b'] = None
+        
         self.state_dim = state_dim
         self.emission_dim = emission_dim
 
@@ -410,7 +400,11 @@ class wGPLDS():
         '''Compute the log prior of the parameters. Conditions are inputs'''
         F = self.wgps['A'](params.dynamics_gp_weights, inputs)
         logprior_A = self.wgps['A'].log_prob(inputs, F).sum()
-        logprior_b = self.wgps['b'].log_prob(inputs, params.bs).sum()
+
+        if self.wgps['b'] is not None:
+            logprior_b = self.wgps['b'].log_prob(inputs, params.bs).sum()
+        else:
+            logprior_b = 0.
         return logprior_A + logprior_b
 
     def weights_to_params(self, params, inputs):
@@ -504,12 +498,18 @@ class wGPLDS():
         # bias sufficient stats
         F = self.wgps['A'](params.dynamics_gp_weights, inputs)
 
-        Phib = self.wgps['b'].evaluate_basis(inputs)
-        _Zb = Phib.reshape(len(Exn), self.wgps['b'].D2, len(self.wgps['b'].basis_funcs) )
-        _Yb = Exn - jax.vmap(lambda _F, _m: _F @ _m)(F, Exp)
-        _ZbTZb = jnp.einsum('tik,tjl->ikjl', _Zb, _Zb).reshape(len(self.wgps['b'].basis_funcs) * self.wgps['b'].D2, len(self.wgps['b'].basis_funcs) * self.wgps['b'].D2)
-        _ZbTYb = jnp.einsum('tik,tj->ikj', _Zb, _Yb).reshape(len(self.wgps['b'].basis_funcs) * self.wgps['b'].D2, self.wgps['b'].D1)
-        wgpb_stats = (_ZbTZb, _ZbTYb)
+        bias_targets = Exn - jnp.einsum('tij,tj->ti', F, Exp)
+        if self.wgps['b'] is None:
+            bias_stats = (bias_targets, 1)
+        else:
+            Phib = self.wgps['b'].evaluate_basis(inputs)
+            Zb = Phib.reshape(len(Exn), self.wgps['b'].D2, len(self.wgps['b'].basis_funcs))
+            ZbTZb = jnp.einsum('tik,tjl->ikjl', Zb, Zb)
+            ZbTYb = jnp.einsum('tik,tj->ikj', Zb, bias_targets)
+
+            ZbTZb = ZbTZb.reshape(len(self.wgps['b'].basis_funcs) * self.wgps['b'].D2, len(self.wgps['b'].basis_funcs) * self.wgps['b'].D2)
+            ZbTYb = ZbTYb.reshape(len(self.wgps['b'].basis_funcs) * self.wgps['b'].D2, self.wgps['b'].D1)
+            bias_stats = (ZbTZb, ZbTYb)
 
         # more expected sufficient statistics for the emissions
         y = emissions
@@ -518,7 +518,7 @@ class wGPLDS():
         sum_yyT = emissions.T @ emissions
         emission_stats = (sum_xxT, sum_xyT, sum_yyT, num_timesteps)
 
-        return (init_stats, dynamics_stats, wgpA_stats, wgpb_stats, emission_stats), marginal_loglik
+        return (init_stats, dynamics_stats, wgpA_stats, bias_stats, emission_stats), marginal_loglik
     
     def m_step(
             self,
@@ -543,7 +543,7 @@ class wGPLDS():
 
         # Sum the statistics across all batches
         stats = jax.tree_util.tree_map(partial(jnp.sum, axis=0), batch_stats)
-        init_stats, dynamics_stats, wgpA_stats, wgpb_stats, emission_stats = stats
+        init_stats, dynamics_stats, wgpA_stats, bias_stats, emission_stats = stats
 
         # Perform MLE estimation jointly
         sum_x0, sum_x0x0T, N = init_stats
@@ -561,22 +561,23 @@ class wGPLDS():
 
         F_static, Q = fit_linear_regression(*dynamics_stats)
 
-        # Bias update in weight space
-        # bs_target = Exn/init_stats[-1] - jnp.einsum('tij,tj->ti', F, Exp/init_stats[-1])
-        _, bs_reconstructed = fit_gplinear_regression(*wgpb_stats, self.wgps['b'])
-        bs = bs_reconstructed.squeeze()
+        # Bias update
+        if self.wgps['b'] is None:
+            # bs = Exn/bias_stats[-1] - jnp.einsum('tij,tj->ti', F, Exp/bias_stats[-1])
+            bs = bias_stats[0]/bias_stats[1]
+
+            # The following for homogeneous bias
+            # b = jnp.mean(bs, axis=0)
+            # bs = jnp.tile(b, (len(inputs), 1))
+        else: 
+            # In weight space
+            _, bs_reconstructed = fit_gplinear_regression(*bias_stats, self.wgps['b'])
+            bs = bs_reconstructed.squeeze()
 
         # Emission M-step
         H, R = fit_linear_regression(*emission_stats)
         H = jxr.normal(jxr.PRNGKey(0), shape=(self.emission_dim, self.state_dim))
         Cs = jnp.tile(H, (len(inputs)+1, 1, 1)) # Repeat the same emission matrix for all time steps
-
-        # # Fix all others to the true values
-        # Q = 0.01 * jnp.eye(self.state_dim)
-        # R = 0.01 * jnp.eye(self.emission_dim)
-        # m = jnp.zeros(self.state_dim)
-        # S = jnp.eye(self.state_dim)
-        # bs = jnp.ones((len(inputs), self.state_dim))
 
         params = ParamswGPLDS(
             m0=m, S0=S, dynamics_gp_weights=W, bs=bs, Q=Q, Cs=Cs, R=R,
@@ -597,17 +598,18 @@ class wGPLDS():
             # Obtain current E-step stats and joint log prob
             batch_stats, lls = vmap(partial(self.e_step, params))(emissions, inputs)
             log_prior = self.log_prior(params, inputs[0])
-            lp = log_prior + lls.sum()
+            mll = lls.sum()
+            lp = log_prior + mll
 
             # Update with M-step
             params = self.m_step(params, batch_stats, inputs[0])
-            return params, lp
+            return params, (lp, mll)
 
         log_probs = []
         for i in range(num_iters):
-            params, log_prob = em_step(params)
+            params, (log_prob, marginal_log_lik) = em_step(params)
             log_probs.append(log_prob)
-            print(f'Iter {i+1}/{num_iters}, log-prob = {log_prob:.2f}')
+            print(f'Iter {i+1}/{num_iters}, log-prob = {log_prob:.2f}, marginal log-lik = {marginal_log_lik:.2f}')
         return params, jnp.array(log_probs)
 
 # %%
