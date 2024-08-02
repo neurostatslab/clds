@@ -198,7 +198,7 @@ def lgssm_smoother(
 
 # %%
 def torus_basis(N: int, sigma: float=1.0, kappa: float=1.0, period: float=1.0) -> list:
-    '''Returns 4*N basis functions for a torus manifold'''
+    '''Returns 4*N basis functions for a torus T1 manifold'''
     def weight_space_coefficients(m):
         return sigma * jnp.sqrt(jnp.exp(- 2* jnp.pi**2 * kappa**2 * m**2))
     
@@ -214,6 +214,23 @@ def torus_basis(N: int, sigma: float=1.0, kappa: float=1.0, period: float=1.0) -
     assert len(basis_funcs) == 4*N, len(basis_funcs)
     return basis_funcs
 
+def T2_basis(N: int, sigma: float=1.0, kappa: float=1.0, period1: float=1.0, period2=None) -> list:
+    '''Returns basis functions for T2 manifold'''
+    def weight_space_coefficients(m,n):
+        return sigma * jnp.sqrt(jnp.exp(- 2* jnp.pi**2 * kappa**2 * (m**2+n**2)))
+    if period2 is None:
+        period2 = period1
+
+    basis_funcs = []
+    for n in jnp.arange(-N, N):
+        for m in jnp.arange(-N, N):
+            def _f_sin(x, m=m, n=n): # defaults to avoid late binding
+                return weight_space_coefficients(m,n) * jnp.sin(2*jnp.pi * (m * x[0] / period1 + n * x[1] / period2))
+            def _f_cos(x, m=m, n=n):
+                return weight_space_coefficients(m,n) * jnp.cos(2*jnp.pi * (m * x[0] / period1 + n * x[1] / period2))
+            basis_funcs.append(_f_sin)
+            basis_funcs.append(_f_cos)
+    return basis_funcs
 
 # %%
 @jax.jit
