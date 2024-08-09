@@ -197,7 +197,7 @@ def lgssm_smoother(
     return ll, filter_results, smoother_results
 
 # %%
-def torus_basis(N: int, sigma: float=1.0, kappa: float=1.0, period: float=1.0) -> list:
+def T1_basis(N: int, sigma: float=1.0, kappa: float=1.0, period: float=1.0) -> list:
     '''Returns 4*N basis functions for a torus T1 manifold'''
     def weight_space_coefficients(m):
         return sigma * jnp.sqrt(jnp.exp(- 2* jnp.pi**2 * kappa**2 * m**2))
@@ -233,7 +233,6 @@ def T2_basis(N: int, sigma: float=1.0, kappa: float=1.0, period1: float=1.0, per
     return basis_funcs
 
 # %%
-@jax.jit
 def logprob_analytic(
         x: Float[Array, "N"], mu: Float[Array, "N"], cov: Float[Array, "N N"]
         ) -> float:
