@@ -340,10 +340,7 @@ class WeightSpaceGaussianProcess():
         PhiX = self.evaluate_basis(xs)
         return jnp.einsum('kij,tk->tij', weights, PhiX)
     
-    def weights(self, key: jxr.PRNGKey) -> Float[Array, "len_basis D1 D2"]:
-        '''
-        retrieve weights associated with key
-        '''
+    def sample_weights(self, key: jxr.PRNGKey) -> Float[Array, "len_basis D1 D2"]:
         return jxr.normal(key, shape=(len(self.basis_funcs), self.D1, self.D2))
     
     def evaluate_basis(self, x: Float[Array, "T M"]) -> Float[Array, "T len_basis"]:
@@ -353,13 +350,13 @@ class WeightSpaceGaussianProcess():
         '''
         Sample from the GP prior at the points `xs`
         '''
-        weights = self.weights(key)
+        weights = self.sample_weights(key)
         PhiX = self.evaluate_basis(xs)
         return self.__call__(weights, xs)
     
     def log_prob(self, xs: Float[Array, "T M"], fs: Float[Array, "T D1 D2"]) -> Float[Array, "D1 D2"]:
         '''
-        Compute the log probability of the GP draws at the time points ts
+        Compute the log probability of the GP draws at the time points `ts`
         '''
         if fs.ndim == 2:
             assert (self.D1 == 1) ^ (self.D2 == 1), 'Incorrect dimensions'
@@ -386,7 +383,10 @@ class ParamswGPLDS(NamedTuple):
 # %%
 class wGPLDS():
     '''
-    GPLDS with weight-space view parametrization of the parameter priors
+    GPLDS with weight-space view parametrization of the priors for the parameters {A, b, C}. 
+    By default: A has weight GP prior, whereas b and C are optional. 
+                If weight GP priors are not provided for b and C, they are learned as C fixed, b time-varying.
+    This is a early version, only currently supporting EM. Does not support sampling. Does not support inputs other than GP conditions. 
     '''
     def __init__(self, wgps: dict, state_dim: int, emission_dim: int):
         # TODO: Add other dynamics and emission models if we want to sample from it
@@ -425,15 +425,17 @@ class wGPLDS():
         As = self.wgps['A'](params.dynamics_gp_weights, inputs)
         Cs = self.wgps['C'](params.emissions_gp_weights, inputs) if self.wgps['C'] is not None else params.Cs
         bs = self.wgps['b'](params.bias_gp_weights, inputs) if self.wgps['b'] is not None else params.bs
-        bs = bs.squeeze()
-        
-        if Cs.ndim == 2:
-            Cs = jnp.tile(Cs[None], (len(inputs), 1, 1))
         return As, Cs, bs
 
     def smoother(self, params: ParamswGPLDS, emissions, inputs):
         '''inputs as conditions'''
+        # Format params
         As, Cs, bs = self.weights_to_params(params, inputs)
+        bs = bs.squeeze()
+        if Cs.ndim == 2:
+            Cs = jnp.tile(Cs[None], (len(inputs), 1, 1))
+
+        # Run the smoother
         lgssm_params = {
             'm0': params.m0,
             'S0': params.S0,
@@ -571,12 +573,7 @@ class wGPLDS():
                 assume_a='pos'
                 )
             weights = weights.reshape(wgp_prior.D2, len(wgp_prior.basis_funcs), wgp_prior.D1).transpose(1,2,0)
-
-            # # Evaluate the weighted basis functions to obtain the parameters
-            # vals = wgp_prior(weights, conditions)
-            return weights#, vals
-
-        # up = inputs[:-1]
+            return weights
 
         # Sum the statistics across all batches
         stats = jax.tree_util.tree_map(partial(jnp.sum, axis=0), batch_stats)
@@ -601,13 +598,12 @@ class wGPLDS():
 
         # Bias update
         if self.wgps['b'] is None:
-            # bs = Exn/bias_stats[-1] - jnp.einsum('tij,tj->ti', F, Exp/bias_stats[-1])
             W_b = None
             bs = bias_stats[0]/bias_stats[1]
         else: 
             # In weight space
             W_b = fit_gplinear_regression(*bias_stats, self.wgps['b'])
-            bs = None #bs_reconstructed.squeeze()
+            bs = None
         # # The following for homogeneous bias
         # b = jnp.mean(bs, axis=0)
         # bs = jnp.tile(b, (len(up), 1))
@@ -634,7 +630,7 @@ class wGPLDS():
             self,
             params: ParamswGPLDS,
             emissions: Float[Array, "num_batches num_timesteps emission_dim"],
-            inputs: Optional[Float[Array, "num_batches num_timesteps input_dim"]]=None,
+            conditions: Optional[Float[Array, "num_batches num_timesteps input_dim"]]=None,
             num_iters: int=50,
         ):
         assert emissions.ndim == 3, 'emissions should be 3D'
@@ -642,24 +638,24 @@ class wGPLDS():
         @jit
         def em_step(params):
             # Obtain current E-step stats and joint log prob
-            batch_stats, lls = vmap(partial(self.e_step, params))(emissions, inputs)
-            log_prior = self.log_prior(params, inputs[0])
+            batch_stats, lls = vmap(partial(self.e_step, params))(emissions, conditions)
+            log_priors = vmap(partial(self.log_prior, params))(conditions)
             mll = lls.sum()
-            lp = log_prior + mll
+            lp = log_priors.sum() + mll
 
             # Update with M-step
-            params = self.m_step(params, batch_stats)#, inputs[0]) #! Assuming all batches have the same inputs
-            # batch_params = vmap(partial(self.m_step, params, batch_stats))(inputs)
-            # params = jax.tree_util.tree_map(partial(jnp.mean, axis=0), batch_params) # Average accross batch with tree_map
+            params = self.m_step(params, batch_stats)
+            
             return params, (lp, mll)
 
-        log_probs = []
+        log_probs, marginal_log_liks = [], []
         for i in range(num_iters):
             next_params, (log_prob, marginal_log_lik) = em_step(params)
             log_probs.append(log_prob)
+            marginal_log_liks.append(marginal_log_lik)
 
-            if i > 2 and log_prob < log_probs[-2]:
-                print(f'EM stopped at iteration {i+1} due to decreasing log-prob')
+            if i > 2 and marginal_log_lik < marginal_log_liks[-2]:
+                print(f'EM stopped at iteration {i+1} due to decreasing marginal_log_lik')
                 break
 
             if jnp.isnan(log_prob):
@@ -669,3 +665,19 @@ class wGPLDS():
             params = next_params
             print(f'Iter {i+1}/{num_iters}, log-prob = {log_prob:.2f}, marginal log-lik = {marginal_log_lik:.2f}')
         return params, jnp.array(log_probs)
+
+    def log_prob(self, params, emissions, conditions):
+        '''Compute the log probability of the emissions given the parameters'''
+        def batch_log_prob(_emissions, _conditions):
+            log_prior = self.log_prior(params, _conditions)
+            marginal_loglik, _, _ = self.smoother(params, _emissions, _conditions)
+            return log_prior + marginal_loglik
+
+        return vmap(batch_log_prob)(emissions, conditions).sum()
+
+    def marginal_log_lik(self, params, emissions, conditions):
+        '''Compute the marginal log likelihood of the emissions given the parameters'''
+        def batch_marginal_log_lik(_emissions, _conditions):
+            (marginal_loglik, _, _) = self.smoother(params, _emissions, _conditions)
+            return marginal_loglik
+        return vmap(batch_marginal_log_lik)(emissions, conditions).sum()
