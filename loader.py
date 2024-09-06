@@ -4,15 +4,13 @@
 """
 
 import jax.numpy as jnp
+import jax.random as jxr
 import numpy as np
 
-import models
 import jax
 import utils
 
 from scipy.io import loadmat
-from scipy.ndimage import gaussian_filter1d
-
 from functools import partial
 from scipy.stats import ortho_group
 
@@ -222,119 +220,11 @@ class PointAttractor(Dataset):
         b = input_optimized[0][:,1:]*params['dt']
         y = self.project(x,params)
 
-        ts = params['dt']*np.arange(1,steps).astype(float)
+        ts = params['dt']*np.arange(0,steps).astype(float)
         ts = jnp.tile(ts,(ntrials,1))
 
         self.data = utils.split_data_cv(
             {'y':y,'x':x,'b':b,'ts':ts},
-            params['props'],
-            params['seeds']
-        )
-
-
-# %%
-class GPLDSLoader(Dataset):
-    def __init__(self,params):
-        seed = params['seed']
-        key = jax.random.PRNGKey(seed)
-
-        initial = models.InitialCondition(
-            params['D'],
-            scale_tril=params['init_noise']*jnp.eye(params['D'])
-        )
-
-        lds = models.TimeVarLDS(
-            D=params['D'],initial=initial,
-        )
-
-        k1,key = jax.random.split(key,2)
-
-        emission = models.LinearEmission(
-            key=k1,D=params['D'],N=params['N'],
-            C=ortho_group.rvs(
-                params['N'],
-                random_state=np.random.seed(params['seed'])
-            )[:,:params['D']],
-            d=jnp.zeros(params['N'])
-        )
-
-        kernel_A = utils.get_kernel(params['kernel_A'],params['kernel_A_diag'])
-        kernel_b = utils.get_kernel(params['kernel_b'],params['kernel_b_diag'])
-        kernel_L = utils.get_kernel(params['kernel_L'],params['kernel_L_diag'])
-
-        gps = {
-            'A': models.GaussianProcess(kernel_A,params['D'],params['D']),
-            'b': models.GaussianProcess(kernel_b,params['D'],1),
-            'L': models.GaussianProcess(kernel_L,params['D'],params['D'])
-        }
-
-        likelihood = models.NormalConditionalLikelihood(
-            params['N'],
-            scale_tril=params['obs_noise']*jnp.eye(params['N'])
-        )
-        joint = models.GPLDS(
-            gps,
-            lds,
-            emission,
-            likelihood
-        )
-
-        
-        A,b,L = [],[],[]
-        x,y = [],[]
-        ts = []
-        for n in range(params['n_samples']):
-            # k1,key = jax.random.split(key,2)
-            # init_theta = jax.random.uniform(k1, minval=0, maxval=2*np.pi)
-            # k1,key = jax.random.split(key,2)
-            # d_thetas = jax.random.normal(k1,shape=(params['T'],)) * params['theta_drift_scale']
-            # thetas = init_theta + jnp.cumsum(d_thetas)
-            thetas = jnp.linspace(0,2*jnp.pi,params['T']-1)
-            ts.append(thetas)
-
-            As = jnp.eye(params['D'])[...,None] - params['theta_drift_scale']*np.array([
-                [np.cos(thetas), -np.sin(thetas)],
-                [np.sin(thetas), np.cos(thetas)]
-            ])
-            bs = .1*jnp.ones((params['D'],1,params['T']-1))
-
-            
-            # k1,key = jax.random.split(key,2)
-            # bs = gps['bs'].sample(k1,thetas)
-            k1,key = jax.random.split(key,2)
-            Ls = gps['L'].sample(k1,thetas)
-
-            A.append(As)
-            b.append(bs)
-            L.append(Ls)
-            
-            x_ = lds.sample(
-                k1,
-                As.transpose(2,0,1),
-                bs.transpose(2,0,1),
-                Ls.transpose(2,0,1),
-            )
-            x.append(x_)
-
-            stats = emission.f(x_,emission.params)
-            k1,key = jax.random.split(key,2)
-            y_ = likelihood.sample(key=k1,stats=stats)
-            y.append(y_)
-
-        y = jnp.stack(y)
-        # y = y-y.mean(0).mean(0)[None,None]
-        
-        x = jnp.stack(x)
-
-        A = jnp.stack(A)
-        b = jnp.stack(b)
-        L = jnp.stack(L)
-        ts = jnp.stack(ts)
-
-        self.joint = joint
-
-        self.data = utils.split_data_cv(
-            {'y':y,'x':x,'b':b,'ts':ts,'As':A,'bs':b,'Ls':L},
             params['props'],
             params['seeds']
         )
@@ -394,106 +284,95 @@ class RNNData(Dataset):
             params['seeds']
         )
 
-
 # %%
-class RingAttractor(Dataset):
+class HeadDirectionSimulation(Dataset):
     def __init__(self,params):
-        assert  'N' in params and \
-                'width' in params and \
-                'epsilon' in params and \
-                'noise_scale' in params and \
-                'T' in params
+        # Constants
+        n_neurons = params['N']
+        latent_dim = params['D']
         
-        self.n_neurons = params['N']
-
         # tuning curve peaks
-        self.peaks = jnp.linspace(
-            -jnp.pi, jnp.pi, self.n_neurons + 1
-        )[:-1]  
-
-         # tuning curve widths
-        self.widths = params['width']*jnp.ones(self.n_neurons)
-        self.epsilon = params['epsilon']
-        self.noise_scale = params['noise_scale']
+        peaks = jnp.linspace(
+            -params['tuning_peak'], 
+            params['tuning_peak'], 
+            n_neurons + 1
+            )[:-1]
+        
+        # tuning curve widths
+        widths = params['tuning_width'] * jnp.ones(n_neurons)  
+        epsilon = params['epsilon']
+        noise_scale = params['noise_scale']
 
         @partial(jax.vmap, in_axes=(0, 0))
         def dynamics(theta, omega):
             theta = (theta % (2 * jnp.pi)) - jnp.pi
             u = jnp.array([jnp.cos(theta), jnp.sin(theta)])
             v = jnp.array([-jnp.sin(theta), jnp.cos(theta)])
-            A = (1 - self.epsilon) * v[:, None] * v[None, :]
+            A = (1 - epsilon) * v[:, None] * v[None, :]
             b = u + omega * v
-            C = jnp.exp(jnp.cos(theta - self.peaks) / self.widths)[:, None] * (
-                jnp.tile(u[None, :], (self.n_neurons, 1))
+            z = jnp.clip(theta - peaks, -jnp.pi * widths, jnp.pi * widths)
+            C = (1 + jnp.cos(z / widths))[:, None] * (
+                jnp.tile(u[None, :], (n_neurons, 1))
             )
             return (A, b, C)
 
+        def initial_condition(theta, omega):
+            m0 = jnp.array([jnp.cos(theta), jnp.sin(theta)])
+            S0 = noise_scale * jnp.eye(2)
+            return (m0, S0)
 
-        #  Run the dynamics
-        x,y = [],[]
-        As,bs,Cs,ts = [],[],[],[]
-        for i in range(params['K']):
-            # Sample heading direction as a smooth random walk
-            omega = jnp.array(
-                gaussian_filter1d(
-                    jax.random.normal(
-                        jax.random.PRNGKey(params['seed']+i), 
-                        shape=(params['T'],)
-                    ),10
+        def run_dynamics(key, As, bs, Cs, m0, S0):
+            def f(x, inp):
+                A, b, C, (subkey1, subkey2) = inp
+                emission_noise = noise_scale * (
+                    jxr.multivariate_normal(subkey2, jnp.zeros(n_neurons), jnp.eye(n_neurons))
                 )
-            )
-            theta = jnp.cumsum(omega)
+                y = C @ x + emission_noise
+
+                dynamics_noise = noise_scale * (
+                    jxr.multivariate_normal(subkey1, jnp.zeros(2), jnp.eye(2))
+                )
+                x_next = A @ x + b + dynamics_noise
+                return x_next, (x_next, y)
+
+            x_init = jxr.multivariate_normal(key, m0, S0)
+            subkeys = jxr.split(key, num=(As.shape[0],2))
+            _, (x_nexts, ys) = jax.lax.scan(f, x_init, xs=(As, bs, Cs, subkeys))
             
-            # Generate time-varying linear dynamics and initial condition
-            As_, bs_, Cs_ = dynamics(theta, omega)
-            m0_, S0_ = self.initial_condition(
-                theta[0], omega[0]
-            )
+            xs = jnp.concatenate([x_init[None, :], x_nexts[:-1]], axis=0)
+            return xs, ys
 
-            _, (x_, y_) = self.run_dynamics(
-                jax.random.PRNGKey(params['seed']+i), 
-                As_, bs_, Cs_, m0_, S0_
-            )
 
-            x.append(x_)
-            y.append(y_)
-            As.append(As_)
-            bs.append(bs_)
-            Cs.append(Cs_)
-            ts.append(jnp.stack((theta,omega)).T)
+        # Sample heading direction with constant velocity
+        num_timesteps = params['T']
+        speed = params['speed']
+        omega = jnp.ones(num_timesteps) * speed
+        theta = jnp.cumsum(omega)
+
+
+        # Generate time-varying linear dynamics and initial condition
+        true_As, true_bs, true_Cs = dynamics(theta, omega)
+        key = jxr.PRNGKey(params['seed'])
+        key, k1 = jxr.split(key, 2)
+        true_C = jxr.normal(k1, (n_neurons, 2)) # Overwrites neuron tuning
+        true_Cs = jnp.tile(true_C, (num_timesteps, 1, 1))
+        true_m0, true_S0 = initial_condition(theta[0], omega[0])
+
+        # Run the dynamics to get a batch of data
         
-        x = jnp.stack(x)
-        y = jnp.stack(y)
-        As = jnp.stack(As)
-        bs = jnp.stack(bs)
-        Cs = jnp.stack(Cs)
-        ts = jnp.stack(ts)
+        B = params['B']
+        keys = jxr.split(key, B)
+        x, y = jax.vmap(
+            lambda i: run_dynamics(keys[i], true_As, true_bs, true_Cs, true_m0, true_S0)
+        )(jnp.arange(B))
 
-
+        ts = jnp.vstack((omega,theta)).T[None].repeat(B,0)
+        As = true_As[None].repeat(B,0)
+        bs = true_bs[None].repeat(B,0)
+        Cs = true_Cs[None].repeat(B,0)
+        
         self.data = utils.split_data_cv(
             {'y':y,'x':x,'ts':ts,'As':As,'bs':bs,'Cs':Cs},
             params['props'],
             params['seeds']
         ) 
-
-
-    def initial_condition(self, theta, omega):
-        m0 = jnp.array([jnp.cos(theta), jnp.sin(theta)])
-        S0 = self.noise_scale * jnp.eye(2)
-        return (m0, S0)
-
-    def run_dynamics(self, key, As, bs, Cs, m0, S0):
-        def f(x, inp):
-            A, b, C, subkey = inp
-            noise = self.noise_scale * (
-                jax.random.multivariate_normal(
-                    subkey, jnp.zeros(2), jnp.eye(2)
-                )
-            )
-            x_next = A @ x + b + noise
-            return x_next, (x_next, C @ x_next)
-
-        x_init = jax.random.multivariate_normal(key, m0, S0)
-        subkeys = jax.random.split(key, num=As.shape[0])
-        return jax.lax.scan(f, x_init, xs=(As, bs, Cs, subkeys))
-        

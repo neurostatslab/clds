@@ -1,7 +1,7 @@
 # %%
 # -*- coding: utf-8 -*-
 """
-@author: Amin
+@author: Amin, Victor
 """
 
 import jax.numpy as jnp
@@ -256,3 +256,8 @@ def psd_solve(A, b, diagonal_boost=1e-9):
     L, lower = jax.scipy.linalg.cho_factor(A, lower=True)
     x = jax.scipy.linalg.cho_solve((L, lower), b)
     return x
+
+
+def safe_wrap(X):
+    return jnp.where(jnp.isclose(X, 0.), 0., X)
+
