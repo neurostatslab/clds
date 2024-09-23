@@ -22,6 +22,9 @@ from typing import Optional, NamedTuple
 
 # %%
 class Recognition:
+    def __init__(self, params: NamedTuple, **args):
+        self.params = params
+
     def __call__(self, params: ParamsBasis, ts: Float[Array, "T M"]):
         raise NotImplementedError
     
@@ -32,8 +35,9 @@ class Delta(Recognition):
 
 
 class Basis(Recognition):
-    def __init__(self,wgps):
+    def __init__(self, params: ParamsBasis, wgps: dict):
         self.wgps = wgps
+        self.params = params
 
     def __call__(self, params: ParamsBasis, ts: Float[Array, "T M"]):
         latents = ParamsGP(
@@ -46,6 +50,9 @@ class Basis(Recognition):
     
 # %%
 class NoisyRecognition:
+    def __init__(self, params: NamedTuple, **args):
+        self.params = params
+
     def __call__(self, params: NamedTuple, key: jxr.PRNGKey, ys: Float[Array, "T N"], ts: Float[Array, "T M"]):
         '''
         Returns a sample and its log probability
@@ -55,9 +62,7 @@ class NoisyRecognition:
 def variational_inference(
         key: jxr.PRNGKey,
         model: GPLDS,
-        model_params: ParamsGPLDS,
         recognition: NoisyRecognition,
-        recognition_params: NamedTuple,
         ys: Float[Array, "num_batches num_timesteps emission_dim"],
         ts: Float[Array, "num_batches num_timesteps input_dim"],
         n_iter: int = 10000,
@@ -73,7 +78,7 @@ def variational_inference(
     opt_init, opt_update, get_params = optimizers.adam(
         step_size,b1=0.8,b2=0.9,
     )
-    opt_state = opt_init((model_params, recognition_params))
+    opt_state = opt_init((model.params, recognition.params))
     params = get_params(opt_state)
     
     params = get_params(opt_state)
@@ -135,15 +140,17 @@ def variational_inference(
         if i % 10 == 0:
             pbar.set_description('ELBO: {:.2f}, Log Joint: {:.2f}, Log Prior: {:.2f}'.format(loss, log_model, log_prior))
 
-    return params, losses
+    (model_params, recognition_params) = params
+    model.set_params(model_params)
+    recognition.params = recognition_params
+
+    return losses
 
 
 # %%
 def fit_map(
         model: GPLDS,
-        model_params: ParamsGPLDS,
         recognition: Recognition,
-        recognition_params: NamedTuple,
         ys: Float[Array, "num_batches num_timesteps emission_dim"],
         ts: Float[Array, "num_batches num_timesteps input_dim"],
         n_iter: int = 10000,
@@ -156,7 +163,7 @@ def fit_map(
     opt_init, opt_update, get_params = optimizers.adam(
         step_size,b1=0.8,b2=0.9,
     )
-    opt_state = opt_init((model_params, recognition_params))
+    opt_state = opt_init((model.params, recognition.params))
     params = get_params(opt_state)
     
 
@@ -207,15 +214,17 @@ def fit_map(
         if i % 10 == 0:
             pbar.set_description('Loss: {:.2f}, Log Marginal: {:.2f}, Log Prior: {:.2f}'.format(loss, log_marginal, log_prior))
     
+    (model_params, recognition_params) = params
+    model.set_params(model_params)
+    recognition.params = recognition_params
     
-    return params, losses
+    return losses
 
 
 
 # %%
 def fit_em(
         model: wGPLDS,
-        params: ParamswGPLDS,
         emissions: Float[Array, "num_batches num_timesteps emission_dim"],
         conditions: Optional[Float[Array, "num_batches num_timesteps input_dim"]]=None,
         num_iters: int=50,
@@ -224,6 +233,8 @@ def fit_em(
     Requires the model to have the e_step and m_step functions implemented
     '''
     assert emissions.ndim == 3, 'emissions should be 3D'
+
+    params = model.params
 
     @jit
     def em_step(params):
@@ -260,4 +271,5 @@ def fit_em(
         pbar.set_description(f'Iter {i+1}/{num_iters}, log-prob = {log_prob:.2f}, marginal log-lik = {marginal_log_lik:.2f}')
 
 
-    return params, log_probs
+    model.params = params
+    return log_probs

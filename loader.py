@@ -270,7 +270,7 @@ class RNNData(Dataset):
         ).item()
 
 
-        y = data['states'].transpose(1,0,2)
+        y = jnp.array(data['states'].transpose(1,0,2))
         # y = y-y.mean(0).mean(0)[None,None]
         pos = data['p'].transpose(1,0,2)[:,1:]
         vel = data['v'].transpose(1,0,2)[:,1:]

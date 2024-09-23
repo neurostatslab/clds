@@ -16,11 +16,8 @@ from functools import partial
 from jax import jit, lax, vmap
 
 from params import \
-        InitialParams, \
-        ParamsGP, \
         ParamsEmission, \
         ParamsNormalLikelihood, \
-        ParamsPoissonLikelihood, \
         ParamsGPLDS, \
         ParamswGPLDS
 
@@ -71,18 +68,18 @@ class InitialCondition:
     def __init__(self, D: int = 1):
         self.D = D
     
-    def sample(self, params: InitialParams, key: jxr.PRNGKey) -> Float[Array, "D"]:
+    def sample(self, stats, key: jxr.PRNGKey) -> Float[Array, "D"]:
+        b0, L0 = stats
         x = dist.MultivariateNormal(
-            params.b0,
-            scale_tril=params.L0
+            b0,scale_tril=L0
             ).sample(key)
     
         return x
 
-    def log_prob(self, params: InitialParams, x: Float[Array, "D"]) -> Float:
+    def log_prob(self, stats, x: Float[Array, "D"]) -> Float:
+        b0, L0 = stats
         lp = dist.MultivariateNormal(
-            params.b0,
-            scale_tril=params.L0
+            b0,scale_tril=L0
             ).log_prob(x)
         
         return lp
@@ -92,15 +89,16 @@ class TimeVaryingLDS:
     '''
     Differentiable representation of time varying linear dynamical system
     '''
-    def __init__(self,D: int, initial: InitialCondition):
+    def __init__(self, D: int, initial: InitialCondition):
         # dynamics dimension
         self.D = D
         
         # initial condition distribution
         self.initial = initial
 
-    def sample(self, latents: ParamsGP, key: jxr.PRNGKey, x0: Optional[Float[Array, "D"]]=None) -> Float[Array, "T D"]:
-        T, D = len(latents.As)+1, self.D
+    def sample(self, stats: Tuple, key: jxr.PRNGKey, x0: Optional[Float[Array, "D"]]=None) -> Float[Array, "T D"]:
+        (As, bs, Ls) = stats
+        T, D = len(As)+1, self.D
 
         @jit
         def transition(carry, args):
@@ -109,8 +107,7 @@ class TimeVaryingLDS:
             k1, k = jax.random.split(k,2)
             mu = A_new@xs[-1]+b_new[:,0]
             x_new = dist.MultivariateNormal(
-                mu,
-                scale_tril=L_new
+                mu,scale_tril=L_new
                 ).sample(k1)
             xs = jnp.vstack((xs[1:],x_new))
             return (xs,k), None
@@ -119,24 +116,21 @@ class TimeVaryingLDS:
         k1, key = jax.random.split(key,2)
 
         if x0 is None:
-            init_params = InitialParams(
-                b0 = latents.bs[0],
-                L0 = latents.Ls[0]
-            )
-            x0 = self.initial.sample(init_params,k1)
+            x0 = self.initial.sample(stats=(bs[0],Ls[0]),key=k1)
         
         history = jnp.vstack((jnp.ones((T-1,D)),x0[None]))
         (xs,_),_ = lax.scan(
             transition, 
             (history,key), 
-            (latents.As,latents.bs[1:],latents.Ls[1:],jnp.arange(1,T))
+            (As,bs[1:],Ls[1:],jnp.arange(1,T))
         )
         
         return xs
 
 
-    def log_prob(self, latents: ParamsGP, xs: Float[Array, "T D"]):
-        T, D = len(latents.As)+1, self.D
+    def log_prob(self, stats: Tuple, xs: Float[Array, "T D"]):
+        (As, bs, Ls) = stats
+        T, D = len(As)+1, self.D
 
         @jit
         def transition(carry, args):
@@ -156,13 +150,14 @@ class TimeVaryingLDS:
         history = jnp.vstack((jnp.ones((T-1,D)),xs[0][None]))
         (_,lp) , _ = lax.scan(
             transition, 
-            (history,self.initial.log_prob(xs[0],latents.bs[0])), 
-            (latents.As,latents.bs[1:],latents.Ls[1:],xs[1:],jnp.arange(1,T))
+            (history,self.initial.log_prob(x=xs[0],stats=(bs[0],Ls[0]))), 
+            (As,bs[1:],Ls[1:],xs[1:],jnp.arange(1,T))
         )
         
         return lp
 
-    def filter(self, latents: ParamsGP):
+    def filter(self, stats):
+        As, bs, Ls = stats
         D = self.D
 
         def predict(carry,inputs):
@@ -177,14 +172,13 @@ class TimeVaryingLDS:
         b0 = jnp.zeros((D,1))[None]
         L0 = jnp.zeros((D,D))[None]
 
-        A_ = jnp.concatenate((A0,latents.As))
-        b_ = jnp.concatenate((b0,latents.bs[1:]))
-        L_ = jnp.concatenate((L0,latents.Ls[1:]))
+        A_ = jnp.concatenate((A0,As))
+        b_ = jnp.concatenate((b0,bs[1:]))
+        L_ = jnp.concatenate((L0,Ls[1:]))
 
         _, (mus, sigmas) = jax.lax.scan(
                 predict,
-                (latents.bs[0],
-                 latents.Ls[0]@latents.Ls[0].T),
+                (bs[0],Ls[0]@Ls[0].T),
                 (A_,b_,L_)
             )
         return mus.squeeze(), sigmas
@@ -192,54 +186,55 @@ class TimeVaryingLDS:
 
 # %%
 class ConditionalLikelihood:
-    def sample(self):
+    def sample(self, params, stats, key):
+        self.params = None
         raise NotImplementedError
     
-    def log_prob(self):
+    def log_prob(self, params, stats, y):
         raise NotImplementedError
 
 # %%
 class PoissonConditionalLikelihood(ConditionalLikelihood):
-    def __init__(self,D):
+    def __init__(self, D: int):
         self.D = D
     
-    def sample(self, key: jxr.PRNGKey, stats: Float[Array, "D"]) -> Float[Array, "D"]:
+    def sample(self, params: None, stats: Float[Array, "D"], key: jxr.PRNGKey) -> Float[Array, "D"]:
         rate = stats
         y = dist.Poisson(jax.nn.softplus(rate)).to_event(1).sample(key)
         return y
     
-    def log_prob(self, params: ParamsPoissonLikelihood, stats: Float[Array, "D"], y: Float[Array, "D"]) -> Float:
+    def log_prob(self, params: None, stats: Float[Array, "D"], y: Float[Array, "D"]) -> Float:
         rate = stats
         lp = dist.Poisson(jax.nn.softplus(rate)).to_event(1).log_prob(y)
         return lp
     
 # %%
 class NormalConditionalLikelihood(ConditionalLikelihood):
-    def __init__(self, D: int = 1):
+    def __init__(self, params: ParamsNormalLikelihood, D: int = 1):
         self.D = D
-    
+        self.params = params
+
     def sample(self, params: ParamsNormalLikelihood, stats: Float[Array, "N"], key: jxr.PRNGKey) -> Float[Array, "N"]:
         y = dist.MultivariateNormal(
-            stats,
-            scale_tril=params.scale_tril
+            stats,scale_tril=params.scale_tril
             ).sample(key)
         return y
     
     def log_prob(self,params: ParamsNormalLikelihood, y: Float[Array, "N"], stats: Float[Array, "N"]) -> Float:
         lp = dist.MultivariateNormal(
-            stats,
-            scale_tril=params.scale_tril
+            stats,scale_tril=params.scale_tril
             ).log_prob(y)
         return lp
     
 
 # %%
 class LinearEmission:
-    def __init__(self, D: int, N: int):
+    def __init__(self, params: ParamsEmission, D: int, N: int):
         self.D = D # dynamics dimension
         self.N = N # observation dimension
+        self.params = params
 
-    def __call__(self,params: ParamsEmission,x: Float[Array, "D"]) -> Float[Array, "N"]:
+    def __call__(self, params: ParamsEmission, x: Float[Array, "D"]) -> Float[Array, "N"]:
         y = x@params.Cs.T + params.ds[None]
         return y
 
@@ -253,6 +248,11 @@ class GPLDS:
         self.dynamics = dynamics
         self.emissions = emissions
         self.likelihood = likelihood
+
+        self.params = ParamsGPLDS(
+            emissions = emissions.params,
+            likelihood = likelihood.params
+        )
         
     def sample(self, params: ParamsGPLDS, ts: Float[Array, "T M"], key: jxr.PRNGKey) -> Float[Array, "N"]:
         '''
@@ -260,17 +260,11 @@ class GPLDS:
         '''
         kA,kb,kL,key = jax.random.split(key,4)
         
-        latents = ParamsGP(
-            As = self.gps['A'].sample(kA,ts),
-            bs = self.gps['b'].sample(kb,ts),
-            Ls = self.gps['L'].sample(kL,ts)
-        )
-        
+        stats = (self.gps['A'].sample(kA,ts), self.gps['b'].sample(kb,ts), self.gps['L'].sample(kL,ts))
         k1, key = jax.random.split(key,2)
         x = self.dynamics.sample(
-            latents=latents,
-            key=k1,
-            x0=None
+            stats=stats,
+            key=k1,x0=None
         )
 
         stats = self.emissions(params.emissions,x)
@@ -278,30 +272,32 @@ class GPLDS:
         k1, key = jax.random.split(key,2)
         y = self.likelihood.sample(
             params.likelihood,
-            key=k1,
-            stats=stats
+            stats=stats,key=k1
         )
         
         return y
 
-    def log_prob(self, params: ParamsGPLDS, latents: ParamsGP, y: Float[Array, "T N"], x: Float[Array, "D"], ts: Float[Array, "T M"]) -> Float:
+    def log_prob(self, params: ParamsGPLDS, stats: Tuple, y: Float[Array, "T N"], x: Float[Array, "D"], ts: Float[Array, "T M"]) -> Float:
         '''
         Evaluate the log probability of the GPLDS draws at the time points `ts`, latents `x`, and observations `y`
         '''
-        lpA = self.gps['A'].log_prob(ts,latents.As)
-        lpb = self.gps['b'].log_prob(ts,latents.As)
-        lpL = self.gps['L'].log_prob(ts,latents.As)
+        (As, bs, Ls) = stats
 
-        ld = self.dynamics.log_prob(latents=latents,xs=x)
+        lpA = self.gps['A'].log_prob(ts,As)
+        lpb = self.gps['b'].log_prob(ts,bs)
+        lpL = self.gps['L'].log_prob(ts,Ls)
+
+        ld = self.dynamics.log_prob(stats=stats,xs=x)
         stats = self.emissions(params.emissions,x)
         le = self.likelihood.log_prob(params.likelihood,stats,y=y)
         
         return lpA.sum()+lpb.sum()+lpL.sum()+ld.sum()+le.sum()
     
-    def log_marginal(self, params: ParamsGPLDS, latents: ParamsGP, y: Float[Array, "T N"]) -> Float:
+    def log_marginal(self, params: ParamsGPLDS, stats: Tuple, y: Float[Array, "T N"]) -> Float:
         '''
         Function for integrating out local latents (x)
         '''
+        (As, bs, Ls) = stats
         def transition(carry,inputs):
             # Unpack carry from last iteration
             m_last, P_last = carry
@@ -337,22 +333,23 @@ class GPLDS:
         
         D = self.dynamics.D
 
-        A_ = jnp.concatenate((jnp.eye(D)[None],latents.As))
-        b_ = jnp.concatenate((jnp.zeros((D,1))[None],latents.bs[1:]))
-        L_ = jnp.concatenate((jnp.zeros((D,D))[None],latents.Ls[1:]))
+        A_ = jnp.concatenate((jnp.eye(D)[None],As))
+        b_ = jnp.concatenate((jnp.zeros((D,1))[None],bs[1:]))
+        L_ = jnp.concatenate((jnp.zeros((D,D))[None],Ls[1:]))
         
         log_marginal = jax.lax.scan(
                 transition, 
-                (latents.bs[0],latents.Ls[0]@latents.Ls[0].T),
+                (bs[0],Ls[0]@Ls[0].T),
                 (A_,b_,L_,y)
             )[1].sum()
         
         return  log_marginal
     
-    def log_prior(self, latents: ParamsGP, ts: Float[Array, "T M"]) -> Float:
-        lpA = self.gps['A'].log_prob(ts[1:],latents.As)
-        lpb = self.gps['b'].log_prob(ts,latents.bs)
-        lpL = self.gps['L'].log_prob(ts,latents.Ls)
+    def log_prior(self, stats: Tuple, ts: Float[Array, "T M"]) -> Float:
+        (As, bs, Ls) = stats
+        lpA = self.gps['A'].log_prob(ts[1:],As)
+        lpb = self.gps['b'].log_prob(ts,bs)
+        lpL = self.gps['L'].log_prob(ts,Ls)
 
         # sum over time points
         log_prior = (lpA.sum()+lpb.sum()+lpL.sum())
@@ -360,11 +357,12 @@ class GPLDS:
         # pior needs to be counted once for the whole batch
         return log_prior
 
-    def filter(self, params: ParamsGPLDS, latents: ParamsGP):
+    def filter(self, params: ParamsGPLDS, stats: Tuple):
         '''
         Returns the mean and covariance of latents and observations by running filtering
         '''
-        mus, sigmas = self.dynamics.filter(latents)
+
+        mus, sigmas = self.dynamics.filter(stats)
 
         sigmas_obs = jnp.array([
             params.emissions.Cs@sigmas[t]@params.emissions.Cs.T + \
@@ -373,6 +371,10 @@ class GPLDS:
         mus_obs = (params.emissions.Cs @ mus.T).T + params.emissions.ds
 
         return (mus.squeeze(), sigmas), (mus_obs.squeeze(), sigmas_obs)
+    
+    def set_params(self, params:ParamsGPLDS):
+        self.likelihood.params = params.likelihood
+        self.emissions.params = params.emissions
 
 # %%
 class WeightSpaceGaussianProcess():
@@ -433,7 +435,7 @@ class wGPLDS():
                 If weight GP priors are not provided for b and C, they are learned as C fixed, b time-varying.
     This is a early version, only currently supporting EM. Does not support sampling. Does not support inputs other than GP conditions. 
     '''
-    def __init__(self, wgps: dict, state_dim: int, emission_dim: int):
+    def __init__(self, params: ParamswGPLDS, wgps: dict, state_dim: int, emission_dim: int):
         # TODO: Add other dynamics and emission models if we want to sample from it
         self.wgps = wgps
         assert 'A' in self.wgps, 'Dynamics GP prior is required'
@@ -444,6 +446,7 @@ class wGPLDS():
         
         self.state_dim = state_dim
         self.emission_dim = emission_dim
+        self.params = params
 
     def log_prior(self, params: ParamswGPLDS, inputs):
         '''Compute the log prior of the parameters. Conditions are inputs'''

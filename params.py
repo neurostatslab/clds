@@ -8,11 +8,6 @@ from typing import NamedTuple
 
 
 # %%
-class InitialParams(NamedTuple):
-    b0: Float[Array, "state_dim"]
-    L0: Float[Array, "state_dim state_dim"]
-
-
 class ParamsGP(NamedTuple):
     As: Float[Array, "num_timesteps state_dim state_dim"]
     bs: Float[Array, "num_timesteps state_dim"]
@@ -25,10 +20,6 @@ class ParamsEmission(NamedTuple):
 
 class ParamsNormalLikelihood(NamedTuple):
     scale_tril: Float[Array, "emission_dim emission_dim"]
-
-class ParamsPoissonLikelihood(NamedTuple):
-    rate: Float[Array, "emission_dim"]
-
 
 class ParamsGPLDS(NamedTuple):
     emissions:  ParamsEmission
