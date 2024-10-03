@@ -146,3 +146,6 @@ notebooks/figures/
 *.mp4
 *.png
 *.jpg
+
+# Non-code manuscript files
+manuscript_files/

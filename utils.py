@@ -9,6 +9,7 @@ import jax
 import numpy as np
 from functools import reduce
 from jaxtyping import Float, Array
+import mpmath
 
 # %%
 def random_rotation(key, n, theta):
@@ -197,21 +198,29 @@ def lgssm_smoother(
     return ll, filter_results, smoother_results
 
 # %%
+def squared_exponential_spectral_measure(m, sigma, kappa):
+    C_inf = float(mpmath.jtheta(3, 0., mpmath.exp(-2 * mpmath.pi**2 * kappa**2)))
+    return (sigma**2 / C_inf) * jnp.exp(- 2* jnp.pi**2 * kappa**2 * m**2)
+
 def T1_basis(N: int, sigma: float=1.0, kappa: float=1.0, period: float=1.0) -> list:
-    '''Returns 4*N basis functions for a torus T1 manifold'''
-    def weight_space_coefficients(m):
-        return sigma * jnp.sqrt(jnp.exp(- 2* jnp.pi**2 * kappa**2 * m**2))
+    '''
+    Regular Fourier Features sample approximation to GP over T1.
+    https://arxiv.org/pdf/2006.10160, equation (13)
+    https://jmlr.org/papers/volume18/16-579/16-579.pdf, eq 17
+    '''
+    def coef(m):
+        return jnp.sqrt(squared_exponential_spectral_measure(m, sigma, kappa))
     
     basis_funcs = []
-    for n in jnp.arange(-N, N):
+    for n in jnp.arange(-N, N+1):
         def _f_sin(x, n=n): # make sure to add n=n to avoid late binding
-            return weight_space_coefficients(n) * jnp.sin(n * 2*jnp.pi * x / period)
+            return coef(n) * jnp.sin(n * 2*jnp.pi * x / period)
         def _f_cos(x, n=n):
-            return weight_space_coefficients(n) * jnp.cos(n * 2*jnp.pi * x / period)
+            return coef(n) * jnp.cos(n * 2*jnp.pi * x / period)
         basis_funcs.append(_f_sin)
         basis_funcs.append(_f_cos)
 
-    assert len(basis_funcs) == 4*N, len(basis_funcs)
+    assert len(basis_funcs) == 2*(2*N+1), len(basis_funcs)
     return basis_funcs
 
 def T2_basis(N: int, sigma: float=1.0, kappa: float=1.0, period1: float=1.0, period2=None) -> list:
