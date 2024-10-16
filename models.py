@@ -13,6 +13,12 @@ from utils import logprob_analytic
 from functools import partial
 from jax import jit, lax, vmap
 
+import logging
+logging.basicConfig(level=logging.INFO, format='[%(filename)s][%(asctime)s] %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+from scipy.linalg import solve_sylvester
+
 import utils
 
 import numpyro.distributions as dist
@@ -543,6 +549,7 @@ class wGPLDS():
         Expxn_b = Expxn - jnp.einsum('ti,tj->tij', Exp, bs)
         ExpxpT = jnp.einsum('ti,tj->tij', Exp, Exp) + Vxp
         wgpA_stats = weightspace_stats(ExpxpT, Expxn_b, self.wgps['A'], up)
+        wgpA_sylvester_stats = (wgpA_stats[0], params.Q, wgpA_stats[1], 1)
 
         # Q sufficient stats # TODO. Currently uses static sufficient stats
         # Vxn, Vxp = Vx[1:], Vx[:-1]
@@ -569,12 +576,15 @@ class wGPLDS():
 
         if self.wgps['C'] is None:
             wgpC_stats = None
+            wgpC_sylvester_stats = None
         else:
             _xxT = jnp.einsum('ti,tj->tij', Ex, Ex) + Vx
             _xyT = jnp.einsum('ti,tj->tij', Ex, y)
             wgpC_stats = weightspace_stats(_xxT, _xyT, self.wgps['C'], inputs)
 
-        return (init_stats, wgpm0_stats, dynamics_stats, wgpA_stats, bias_stats, emission_stats, wgpC_stats), marginal_loglik
+            wgpC_sylvester_stats = (wgpC_stats[0], params.R, wgpC_stats[1], 1)
+
+        return (init_stats, wgpm0_stats, dynamics_stats, wgpA_stats, bias_stats, emission_stats, wgpC_stats, wgpA_sylvester_stats, wgpC_sylvester_stats), marginal_loglik
     
     def m_step(
             self,
@@ -595,10 +605,17 @@ class wGPLDS():
                 )
             weights = weights.reshape(wgp_prior.D2, len(wgp_prior.basis_funcs), wgp_prior.D1).transpose(1,2,0)
             return weights
+        
+        def fit_gplinear_regression_sylvester(ZTZ, Sigma, ZTY, wgp_prior):
+            # Solve a linear regression in weight-space given sufficient statistics
+            # weights = utils.jax_solve_sylvester(B, ZTZ, ZTY, assume_a='pos')
+            weights = utils.jax_solve_sylvester_BS(ZTZ, Sigma, ZTY)
+            weights = weights.reshape(wgp_prior.D2, len(wgp_prior.basis_funcs), wgp_prior.D1).transpose(1,2,0)
+            return weights
 
         # Sum the statistics across all batches
         stats = jax.tree_util.tree_map(partial(jnp.sum, axis=0), batch_stats)
-        init_stats, wgpm0_stats, dynamics_stats, wgpA_stats, bias_stats, emission_stats, wgpC_stats = stats
+        init_stats, wgpm0_stats, dynamics_stats, wgpA_stats, bias_stats, emission_stats, wgpC_stats, wgpA_sylvester_stats, wgpC_sylvester_stats = stats
 
         # Perform MLE estimation jointly
         sum_x0, sum_x0x0T, N = init_stats
@@ -611,7 +628,11 @@ class wGPLDS():
             m = None
 
         # Dynamics M-step
-        W_A = fit_gplinear_regression(*wgpA_stats, self.wgps['A'])
+        # W_A = fit_gplinear_regression(*wgpA_stats, self.wgps['A'])
+        W_A = fit_gplinear_regression_sylvester(
+            wgpA_sylvester_stats[0], wgpA_sylvester_stats[1] / wgpA_sylvester_stats[3], wgpA_sylvester_stats[2],
+            wgp_prior=self.wgps['A']
+            )
 
         # TODO: Q M-step. Currently uses static sufficient stats
         # Vxn, Vxp = Vx[1:], Vx[:-1]
@@ -645,10 +666,16 @@ class wGPLDS():
             # Cs = jnp.tile(true_C, (100, 1, 1))
         else:
             # In weight space
-            W_C = fit_gplinear_regression(*wgpC_stats, self.wgps['C'])
+            # W_C = fit_gplinear_regression(*wgpC_stats, self.wgps['C'])
+            W_C = fit_gplinear_regression_sylvester(
+                wgpC_sylvester_stats[0], wgpC_sylvester_stats[1] / wgpC_sylvester_stats[3], wgpC_sylvester_stats[2],
+                wgp_prior=self.wgps['C']
+                )
             Cs = None
 
+        # logger.warning('Warning, fixing R')
         # Q = jnp.eye(self.state_dim) # Can fix Q to be identity (for identifiability)
+        # R = jnp.eye(self.emission_dim)
         params = ParamswGPLDS(
             m0=m, S0=S, 
             dynamics_gp_weights=W_A, 
@@ -666,6 +693,7 @@ class wGPLDS():
             emissions: Float[Array, "num_batches num_timesteps emission_dim"],
             conditions: Optional[Float[Array, "num_batches num_timesteps input_dim"]]=None,
             num_iters: int=50,
+            verbose: bool=True,
         ):
         assert emissions.ndim == 3, 'emissions should be 3D'
 
@@ -688,16 +716,16 @@ class wGPLDS():
             log_probs.append(log_prob)
             marginal_log_liks.append(marginal_log_lik)
 
-            if i > 2 and marginal_log_lik < marginal_log_liks[-2]:
-                print(f'EM stopped at iteration {i+1} due to decreasing marginal_log_lik')
-                break
+            if i > 2 and log_prob < log_probs[-2]:
+                logger.warning(f'Decreasing log prob on iteration {i+1}')
 
             if jnp.isnan(log_prob) and jnp.isnan(marginal_log_lik):
-                print(f'EM stopped at iteration {i+1} due to NaN values')
+                logger.error(f'EM stopped at iteration {i+1} due to NaN values')
                 break
 
             params = next_params
-            print(f'Iter {i+1}/{num_iters}, log-prob = {log_prob:.2f}, marginal log-lik = {marginal_log_lik:.2f}')
+            if verbose:
+                logger.info(f'Iter {i+1}/{num_iters}, log-prob = {log_prob:.2f}, marginal log-lik = {marginal_log_lik:.2f}')
         return params, jnp.array(log_probs)
 
     def log_prob(self, params, emissions, conditions):

@@ -265,3 +265,51 @@ def psd_solve(A, b, diagonal_boost=1e-9):
     L, lower = jax.scipy.linalg.cho_factor(A, lower=True)
     x = jax.scipy.linalg.cho_solve((L, lower), b)
     return x
+# %%
+def jax_solve_sylvester_BS(A, B, C, **kwargs):
+    """
+    Solve the Sylvester equation AX + XB = C for X using the Bartels-Stewart algorithm.
+    # WARNING: only implemented for A, B with real eigenvalues.
+    """
+    def solve_triangular_system(R, S, F):
+        """
+        Solve the triangular system RY + YS = C for Y using forward substitution on the blocks.
+        """
+        n = R.shape[0]
+        m = S.shape[0]
+        Y = jnp.zeros((n, m), dtype=C.dtype)
+        for k in range(m):
+            Y_k = jax.scipy.linalg.solve(R + S[k,k] * jnp.eye(n), F[:,k] - Y[:,k+1:] @ S[k+1:,k])
+            Y = Y.at[:,k].set(Y_k)
+        return Y
+    
+    # Compute the Schur decompositions of A and B
+    R, U = jax.scipy.linalg.schur(A)
+    S, V = jax.scipy.linalg.schur(B)
+
+    # Transform C into the Schur basis
+    F = U.T @ C @ V
+
+    # Solve the triangular system
+    Y = solve_triangular_system(R, S, F)
+
+    # Transform the solution back to the original basis
+    X = U @ Y @ V.T
+    return X
+
+def test_sylvester():
+    key = jax.random.PRNGKey(0)
+    dim_1, dim_2 = 3, 2
+    subkeys = jax.random.split(key, 3)
+    A = jax.random.normal(subkeys[0], (dim_1, dim_1))
+    B = jax.random.normal(subkeys[1], (dim_2, dim_2))
+    
+    # Make A and B have real eigenvalues only 
+    A = A + A.T
+    B = B + B.T
+
+    X = jax.random.normal(subkeys[2], (dim_1, dim_2))
+    C = A @ X + X @ B
+
+    X_hat = jax_solve_sylvester_BS(A, B, C)
+    assert jnp.allclose(X, X_hat, atol=1e-5), X - X_hat
