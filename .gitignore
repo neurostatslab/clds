@@ -141,6 +141,7 @@ cython_debug/
 # Outputfiles
 saves/
 notebooks/figures/
+notebooks/*.txt
 
 # images and videos
 *.mp4
