@@ -15,6 +15,18 @@ from utils import logprob_analytic
 from functools import partial
 from jax import jit, lax, vmap
 
+import logging
+logging.basicConfig(level=logging.INFO, format='[%(filename)s][%(asctime)s] %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+from scipy.linalg import solve_sylvester
+
+import logging
+logging.basicConfig(level=logging.INFO, format='[%(filename)s][%(asctime)s] %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+from scipy.linalg import solve_sylvester
+
 from params import \
         ParamsEmission, \
         ParamsNormalLikelihood, \
@@ -422,10 +434,27 @@ class WeightSpaceGaussianProcess():
         T = len(fs)
         Phi = self.evaluate_basis(xs) # T x K
         cov = jnp.dot(Phi, Phi.T)   # T x T
-        # return dist.MultivariateNormal(jnp.zeros(T), covariance_matrix=cov).log_prob(fs.reshape(T,-1).T).reshape(self.D1, self.D2)
-        return jax.vmap(lambda _f: logprob_analytic(_f, jnp.zeros(T), cov), in_axes=(1))(fs.reshape(T, -1)).reshape(self.D1, self.D2)
+        return dist.MultivariateNormal(jnp.zeros(T), covariance_matrix=cov).log_prob(fs.reshape(T,-1).T).reshape(self.D1, self.D2)
+        # return jax.vmap(lambda _f: logprob_analytic(_f, jnp.zeros(T), cov), in_axes=(1))(fs.reshape(T, -1)).reshape(self.D1, self.D2)
 
+    def log_prob_weights(self, weights: Float[Array, "len_basis D1 D2"]) -> float:
+        '''
+        Standard Gaussian prior on the weights
+        '''
+        return -0.5 * jnp.sum(weights**2)
 
+# %%
+class ParamswGPLDS(NamedTuple):
+    m0: Float[Array, "state_dim"]                               # Accessed if 'm0' wgp prior is None
+    m0_gp_weights: Float[Array, "state_dim 1 len_basis"]
+    S0: Float[Array, "state_dim state_dim"]
+    dynamics_gp_weights: Float[Array, "state_dim state_dim len_basis"]
+    emissions_gp_weights: Float[Array, "emission_dim state_dim len_basis"]
+    Cs: Float[Array, "num_timesteps emission_dim state_dim"]    # Accessed if 'C' wgp prior is None
+    bias_gp_weights: Float[Array, "state_dim 1 len_basis"]
+    bs: Float[Array, "num_timesteps state_dim"]                 # Accessed if 'b' wgp prior is None
+    Q: Float[Array, "state_dim state_dim"]
+    R: Float[Array, "emission_dim emission_dim"]
 
 # %%
 class wGPLDS():
@@ -443,6 +472,8 @@ class wGPLDS():
             self.wgps['b'] = None
         if 'C' not in self.wgps:
             self.wgps['C'] = None
+        if 'm0' not in self.wgps:
+            self.wgps['m0'] = None
         
         self.state_dim = state_dim
         self.emission_dim = emission_dim
@@ -450,22 +481,25 @@ class wGPLDS():
 
     def log_prior(self, params: ParamswGPLDS, inputs):
         '''Compute the log prior of the parameters. Conditions are inputs'''
-        F = self.wgps['A'](params.dynamics_gp_weights, inputs)
-        logprior_A = self.wgps['A'].log_prob(inputs, F).sum()
+        logprior_A = self.wgps['A'].log_prob_weights(params.dynamics_gp_weights)
 
         if self.wgps['b'] is None:
             logprior_b = 0.
         else:
-            bs = self.wgps['b'](params.bias_gp_weights, inputs)
-            logprior_b = self.wgps['b'].log_prob(inputs, bs).sum()
+            logprior_b = self.wgps['b'].log_prob_weights(params.bias_gp_weights)
 
         if self.wgps['C'] is None:
             logprior_C = 0.
         else:
-            Cs = self.wgps['C'](params.emissions_gp_weights, inputs)
-            logprior_C = self.wgps['C'].log_prob(inputs, Cs).sum()
+            logprior_C = self.wgps['C'].log_prob_weights(params.emissions_gp_weights)
+
+        if self.wgps['m0'] is None:
+            logprior_m0 = 0.
+        else:
+            logprior_m0 = self.wgps['m0'].log_prob_weights(params.m0_gp_weights)
+
         
-        return logprior_A + logprior_b + logprior_C
+        return logprior_A + logprior_b + logprior_C + logprior_m0
 
     def weights_to_params(self, params, inputs):
         '''Transform weights of weight space into parameters. 
@@ -473,19 +507,19 @@ class wGPLDS():
         As = self.wgps['A'](params.dynamics_gp_weights, inputs)
         Cs = self.wgps['C'](params.emissions_gp_weights, inputs) if self.wgps['C'] is not None else params.Cs
         bs = self.wgps['b'](params.bias_gp_weights, inputs) if self.wgps['b'] is not None else params.bs
-        return As, Cs, bs
+        m0 = self.wgps['m0'](params.m0_gp_weights, inputs)[0] if self.wgps['m0'] is not None else params.m0 #! Some unnecessary computation, keeping only t=0
+        return As, Cs, bs.squeeze(), m0.squeeze()
 
     def smoother(self, params: ParamswGPLDS, emissions, inputs):
         '''inputs as conditions'''
         # Format params
-        As, Cs, bs = self.weights_to_params(params, inputs)
-        bs = bs.squeeze()
+        As, Cs, bs, m0 = self.weights_to_params(params, inputs)
         if Cs.ndim == 2:
             Cs = jnp.tile(Cs[None], (len(inputs), 1, 1))
 
         # Run the smoother
         lgssm_params = {
-            'm0': params.m0,
+            'm0': m0,
             'S0': params.S0,
             'As': As,
             'bs': bs,
@@ -548,6 +582,14 @@ class wGPLDS():
         Ex0 = smoothed_means[0]
         Ex0x0T = smoothed_covariances[0] + jnp.outer(Ex0, Ex0)
         init_stats = (Ex0, Ex0x0T, 1)
+        if self.wgps['m0'] is None:
+            wgpm0_stats = None
+        else:
+            m0_targets = Ex0.reshape(1, 1, self.state_dim)
+            XTX_m0 = jnp.ones((1, 1, 1))
+
+            _cond = up[0].reshape(1) if up[0].ndim == 0 else up[0].reshape(1, up.shape[1])
+            wgpm0_stats = weightspace_stats(XTX_m0, m0_targets, self.wgps['m0'], _cond)
 
         # expected sufficient statistics for the dynamics
         # let zp[t] = [x[t], u[t]] for t = 0...T-2
@@ -558,6 +600,7 @@ class wGPLDS():
         dynamics_stats = (sum_xpxpT, sum_xpxnT, sum_xnxnT, num_timesteps - 1)
 
         # Dynamics wGP sufficient stats
+        
         # # Partial E-step: assuming delta posterior around mean, hence a lin reg from the smoothed means only
         # PhiAp = self.wgps['A'].evaluate_basis(inputs)
         # _Z = jnp.einsum('tk,ti->tik', PhiAp, Exp)
@@ -570,6 +613,7 @@ class wGPLDS():
         Expxn_b = Expxn - jnp.einsum('ti,tj->tij', Exp, bs)
         ExpxpT = jnp.einsum('ti,tj->tij', Exp, Exp) + Vxp
         wgpA_stats = weightspace_stats(ExpxpT, Expxn_b, self.wgps['A'], up)
+        wgpA_sylvester_stats = (wgpA_stats[0], params.Q, wgpA_stats[1], 1)
 
         # Q sufficient stats # TODO. Currently uses static sufficient stats
         # Vxn, Vxp = Vx[1:], Vx[:-1]
@@ -596,12 +640,15 @@ class wGPLDS():
 
         if self.wgps['C'] is None:
             wgpC_stats = None
+            wgpC_sylvester_stats = None
         else:
             _xxT = jnp.einsum('ti,tj->tij', Ex, Ex) + Vx
             _xyT = jnp.einsum('ti,tj->tij', Ex, y)
             wgpC_stats = weightspace_stats(_xxT, _xyT, self.wgps['C'], inputs)
 
-        return (init_stats, dynamics_stats, wgpA_stats, bias_stats, emission_stats, wgpC_stats), marginal_loglik
+            wgpC_sylvester_stats = (wgpC_stats[0], params.R, wgpC_stats[1], 1)
+
+        return (init_stats, wgpm0_stats, dynamics_stats, wgpA_stats, bias_stats, emission_stats, wgpC_stats, wgpA_sylvester_stats, wgpC_sylvester_stats), marginal_loglik
     
     def m_step(
             self,
@@ -622,18 +669,34 @@ class wGPLDS():
                 )
             weights = weights.reshape(wgp_prior.D2, len(wgp_prior.basis_funcs), wgp_prior.D1).transpose(1,2,0)
             return weights
+        
+        def fit_gplinear_regression_sylvester(ZTZ, Sigma, ZTY, wgp_prior):
+            # Solve a linear regression in weight-space given sufficient statistics
+            # weights = utils.jax_solve_sylvester(B, ZTZ, ZTY, assume_a='pos')
+            weights = utils.jax_solve_sylvester_BS(ZTZ, Sigma, ZTY)
+            weights = weights.reshape(wgp_prior.D2, len(wgp_prior.basis_funcs), wgp_prior.D1).transpose(1,2,0)
+            return weights
 
         # Sum the statistics across all batches
         stats = jax.tree_util.tree_map(partial(jnp.sum, axis=0), batch_stats)
-        init_stats, dynamics_stats, wgpA_stats, bias_stats, emission_stats, wgpC_stats = stats
+        init_stats, wgpm0_stats, dynamics_stats, wgpA_stats, bias_stats, emission_stats, wgpC_stats, wgpA_sylvester_stats, wgpC_sylvester_stats = stats
 
         # Perform MLE estimation jointly
         sum_x0, sum_x0x0T, N = init_stats
         S = sum_x0x0T / N - jnp.outer(sum_x0, sum_x0) / (N**2)
-        m = sum_x0 / N
+        if self.wgps['m0'] is None:
+            W_m0 = None
+            m = sum_x0 / N
+        else:
+            W_m0 = fit_gplinear_regression(*wgpm0_stats, self.wgps['m0'])
+            m = None
 
         # Dynamics M-step
-        W_A = fit_gplinear_regression(*wgpA_stats, self.wgps['A'])
+        # W_A = fit_gplinear_regression(*wgpA_stats, self.wgps['A'])
+        W_A = fit_gplinear_regression_sylvester(
+            wgpA_sylvester_stats[0], wgpA_sylvester_stats[1] / wgpA_sylvester_stats[3], wgpA_sylvester_stats[2],
+            wgp_prior=self.wgps['A']
+            )
 
         # TODO: Q M-step. Currently uses static sufficient stats
         # Vxn, Vxp = Vx[1:], Vx[:-1]
@@ -652,7 +715,7 @@ class wGPLDS():
             # In weight space
             W_b = fit_gplinear_regression(*bias_stats, self.wgps['b'])
             bs = None
-        # # The following for homogeneous bias
+        # # Use the following for homogeneous bias
         # b = jnp.mean(bs, axis=0)
         # bs = jnp.tile(b, (len(up), 1))
 
@@ -661,19 +724,73 @@ class wGPLDS():
         if self.wgps['C'] is None:
             W_C = None
             Cs = H_static
+
+            # print('Warning: Emission C is fixed')
+            # true_C = jxr.normal(jxr.PRNGKey(0), (self.emission_dim, 2)) # Overwrites neuron tuning
+            # Cs = jnp.tile(true_C, (100, 1, 1))
         else:
             # In weight space
-            W_C = fit_gplinear_regression(*wgpC_stats, self.wgps['C'])
+            # W_C = fit_gplinear_regression(*wgpC_stats, self.wgps['C'])
+            W_C = fit_gplinear_regression_sylvester(
+                wgpC_sylvester_stats[0], wgpC_sylvester_stats[1] / wgpC_sylvester_stats[3], wgpC_sylvester_stats[2],
+                wgp_prior=self.wgps['C']
+                )
             Cs = None
 
+        # logger.warning('Warning, fixing R')
+        # Q = jnp.eye(self.state_dim) # Can fix Q to be identity (for identifiability)
+        # R = jnp.eye(self.emission_dim)
         params = ParamswGPLDS(
             m0=m, S0=S, 
-            dynamics_gp_weights=W_A, bias_gp_weights=W_b, emissions_gp_weights=W_C, 
+            dynamics_gp_weights=W_A, 
+            bias_gp_weights=W_b, 
+            emissions_gp_weights=W_C, 
+            m0_gp_weights=W_m0,
             Cs=Cs, bs=bs,
             Q=Q, R=R,
         )
         return params
 
+    def fit_em(
+            self,
+            params: ParamswGPLDS,
+            emissions: Float[Array, "num_batches num_timesteps emission_dim"],
+            conditions: Optional[Float[Array, "num_batches num_timesteps input_dim"]]=None,
+            num_iters: int=50,
+            verbose: bool=True,
+        ):
+        assert emissions.ndim == 3, 'emissions should be 3D'
+
+        @jit
+        def em_step(params):
+            # Obtain current E-step stats and joint log prob
+            batch_stats, lls = vmap(partial(self.e_step, params))(emissions, conditions)
+            log_priors = vmap(partial(self.log_prior, params))(conditions)
+            mll = lls.sum()
+            lp = log_priors.sum() + mll
+
+            # Update with M-step
+            params = self.m_step(params, batch_stats)
+            
+            return params, (lp, mll)
+
+        log_probs, marginal_log_liks = [], []
+        for i in range(num_iters):
+            next_params, (log_prob, marginal_log_lik) = em_step(params)
+            log_probs.append(log_prob)
+            marginal_log_liks.append(marginal_log_lik)
+
+            if i > 2 and log_prob < log_probs[-2]:
+                logger.warning(f'Decreasing log prob on iteration {i+1}')
+
+            if jnp.isnan(log_prob) and jnp.isnan(marginal_log_lik):
+                logger.error(f'EM stopped at iteration {i+1} due to NaN values')
+                break
+
+            params = next_params
+            if verbose:
+                logger.info(f'Iter {i+1}/{num_iters}, log-prob = {log_prob:.2f}, marginal log-lik = {marginal_log_lik:.2f}')
+        return params, jnp.array(log_probs)
 
     def log_prob(self, params, emissions, conditions):
         '''Compute the log probability of the emissions given the parameters'''
