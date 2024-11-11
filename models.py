@@ -393,7 +393,7 @@ class WeightSpaceGaussianProcess():
 
     def __call__(self, 
             weights: Float[Array, "len_basis D1 D2"], 
-            xs: Float[Array, "M T"]
+            xs: Float[Array, "T M"]
         ) -> Float[Array, "T D1 D2"]:
         '''
         Evaluate A_ij(x) = \sum_k w^{(ij)} \phi_k(x) at the M-dimensional points `xs`
@@ -418,7 +418,7 @@ class WeightSpaceGaussianProcess():
     
     def log_prob(self, xs: Float[Array, "T M"], fs: Float[Array, "T D1 D2"]) -> Float[Array, "D1 D2"]:
         '''
-        Compute the log probability of the GP draws at the time points `ts`
+        Compute the log probability of the GP draws at the time points `xs`
         '''
         if fs.ndim == 2:
             assert (self.D1 == 1) ^ (self.D2 == 1), 'Incorrect dimensions'
@@ -434,7 +434,7 @@ class WeightSpaceGaussianProcess():
         '''
         Standard Gaussian prior on the weights
         '''
-        return -0.5 * jnp.sum(weights**2)
+        return -0.5 * jnp.sum(weights**2) - 0.5 * jnp.asarray(weights.shape).prod() * jnp.log(2*jnp.pi)
 
 # %%
 class wGPLDS():
