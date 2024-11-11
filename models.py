@@ -18,13 +18,6 @@ from jax import jit, lax, vmap
 import logging
 logging.basicConfig(level=logging.INFO, format='[%(filename)s][%(asctime)s] %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
-from scipy.linalg import solve_sylvester
-
-import logging
-logging.basicConfig(level=logging.INFO, format='[%(filename)s][%(asctime)s] %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-
 from scipy.linalg import solve_sylvester
 
 from params import \
@@ -444,19 +437,6 @@ class WeightSpaceGaussianProcess():
         return -0.5 * jnp.sum(weights**2)
 
 # %%
-class ParamswGPLDS(NamedTuple):
-    m0: Float[Array, "state_dim"]                               # Accessed if 'm0' wgp prior is None
-    m0_gp_weights: Float[Array, "state_dim 1 len_basis"]
-    S0: Float[Array, "state_dim state_dim"]
-    dynamics_gp_weights: Float[Array, "state_dim state_dim len_basis"]
-    emissions_gp_weights: Float[Array, "emission_dim state_dim len_basis"]
-    Cs: Float[Array, "num_timesteps emission_dim state_dim"]    # Accessed if 'C' wgp prior is None
-    bias_gp_weights: Float[Array, "state_dim 1 len_basis"]
-    bs: Float[Array, "num_timesteps state_dim"]                 # Accessed if 'b' wgp prior is None
-    Q: Float[Array, "state_dim state_dim"]
-    R: Float[Array, "emission_dim emission_dim"]
-
-# %%
 class wGPLDS():
     '''
     GPLDS with weight-space view parametrization of the priors for the parameters {A, b, C}. 
@@ -750,47 +730,6 @@ class wGPLDS():
             Q=Q, R=R,
         )
         return params
-
-    def fit_em(
-            self,
-            params: ParamswGPLDS,
-            emissions: Float[Array, "num_batches num_timesteps emission_dim"],
-            conditions: Optional[Float[Array, "num_batches num_timesteps input_dim"]]=None,
-            num_iters: int=50,
-            verbose: bool=True,
-        ):
-        assert emissions.ndim == 3, 'emissions should be 3D'
-
-        @jit
-        def em_step(params):
-            # Obtain current E-step stats and joint log prob
-            batch_stats, lls = vmap(partial(self.e_step, params))(emissions, conditions)
-            log_priors = vmap(partial(self.log_prior, params))(conditions)
-            mll = lls.sum()
-            lp = log_priors.sum() + mll
-
-            # Update with M-step
-            params = self.m_step(params, batch_stats)
-            
-            return params, (lp, mll)
-
-        log_probs, marginal_log_liks = [], []
-        for i in range(num_iters):
-            next_params, (log_prob, marginal_log_lik) = em_step(params)
-            log_probs.append(log_prob)
-            marginal_log_liks.append(marginal_log_lik)
-
-            if i > 2 and log_prob < log_probs[-2]:
-                logger.warning(f'Decreasing log prob on iteration {i+1}')
-
-            if jnp.isnan(log_prob) and jnp.isnan(marginal_log_lik):
-                logger.error(f'EM stopped at iteration {i+1} due to NaN values')
-                break
-
-            params = next_params
-            if verbose:
-                logger.info(f'Iter {i+1}/{num_iters}, log-prob = {log_prob:.2f}, marginal log-lik = {marginal_log_lik:.2f}')
-        return params, jnp.array(log_probs)
 
     def log_prob(self, params, emissions, conditions):
         '''Compute the log probability of the emissions given the parameters'''
