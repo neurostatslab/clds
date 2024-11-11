@@ -225,6 +225,7 @@ def fit_map(
 # %%
 def fit_em(
         model: wGPLDS,
+        params: ParamswGPLDS,
         emissions: Float[Array, "num_batches num_timesteps emission_dim"],
         conditions: Optional[Float[Array, "num_batches num_timesteps input_dim"]]=None,
         num_iters: int=50,
@@ -232,9 +233,7 @@ def fit_em(
     '''
     Requires the model to have the e_step and m_step functions implemented
     '''
-    assert emissions.ndim == 3, 'emissions should be 3D'
-
-    params = model.params
+    assert emissions.ndim == 3, 'emissions should be 3D, of shape (num_batches, num_timesteps, emission_dim)'
 
     @jit
     def em_step(params):
@@ -270,6 +269,4 @@ def fit_em(
         params = next_params
         pbar.set_description(f'Iter {i+1}/{num_iters}, log-prob = {log_prob:.2f}, marginal log-lik = {marginal_log_lik:.2f}')
 
-
-    model.params = params
-    return log_probs
+    return params, log_probs

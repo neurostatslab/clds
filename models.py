@@ -444,7 +444,7 @@ class wGPLDS():
                 If weight GP priors are not provided for b and C, they are learned as C fixed, b time-varying.
     This is a early version, only currently supporting EM. Does not support sampling. Does not support inputs other than GP conditions. 
     '''
-    def __init__(self, params: ParamswGPLDS, wgps: dict, state_dim: int, emission_dim: int):
+    def __init__(self, wgps: dict, state_dim: int, emission_dim: int):
         # TODO: Add other dynamics and emission models if we want to sample from it
         self.wgps = wgps
         assert 'A' in self.wgps, 'Dynamics GP prior is required'
@@ -457,7 +457,6 @@ class wGPLDS():
         
         self.state_dim = state_dim
         self.emission_dim = emission_dim
-        self.params = params
 
     def log_prior(self, params: ParamswGPLDS, inputs):
         '''Compute the log prior of the parameters. Conditions are inputs'''
