@@ -27,7 +27,8 @@ class ParamsGPLDS(NamedTuple):
 
 
 class ParamswGPLDS(NamedTuple):
-    m0: Float[Array, "state_dim"]
+    m0: Float[Array, "state_dim"]                               # Accessed if 'm0' wgp prior is None
+    m0_gp_weights: Float[Array, "state_dim 1 len_basis"]
     S0: Float[Array, "state_dim state_dim"]
     dynamics_gp_weights: Float[Array, "state_dim state_dim len_basis"]
     emissions_gp_weights: Float[Array, "emission_dim state_dim len_basis"]

@@ -9,6 +9,8 @@ import jax
 import numpy as np
 from functools import reduce
 from jaxtyping import Float, Array
+import mpmath
+import itertools
 
 # %%
 def random_rotation(key, n, theta):
@@ -197,40 +199,85 @@ def lgssm_smoother(
     return ll, filter_results, smoother_results
 
 # %%
+def squared_exponential_spectral_measure(m, sigma, kappa):
+    C_inf = float(mpmath.jtheta(3, 0., mpmath.exp(-2 * mpmath.pi**2 * kappa**2)))
+    return (sigma**2 / C_inf) * jnp.exp(- 2* jnp.pi**2 * kappa**2 * m**2)
+
 def T1_basis(N: int, sigma: float=1.0, kappa: float=1.0, period: float=1.0) -> list:
-    '''Returns 4*N basis functions for a torus T1 manifold'''
-    def weight_space_coefficients(m):
-        return sigma * jnp.sqrt(jnp.exp(- 2* jnp.pi**2 * kappa**2 * m**2))
+    '''
+    Regular Fourier Features sample approximation to GP over T1.
+    https://arxiv.org/pdf/2006.10160, equation (13)
+    https://jmlr.org/papers/volume18/16-579/16-579.pdf, eq 17
+    '''
+    def coef(m):
+        return jnp.sqrt(squared_exponential_spectral_measure(m, sigma, kappa))
     
-    basis_funcs = []
-    for n in jnp.arange(-N, N):
+    constant_func = lambda x: coef(0) * jnp.ones_like(x)
+    basis_funcs = [constant_func]
+    for n in jnp.arange(1,N):
         def _f_sin(x, n=n): # make sure to add n=n to avoid late binding
-            return weight_space_coefficients(n) * jnp.sin(n * 2*jnp.pi * x / period)
+            return coef(n) * jnp.sin(n * 2*jnp.pi * x / period)
         def _f_cos(x, n=n):
-            return weight_space_coefficients(n) * jnp.cos(n * 2*jnp.pi * x / period)
+            return coef(n) * jnp.cos(n * 2*jnp.pi * x / period)
         basis_funcs.append(_f_sin)
         basis_funcs.append(_f_cos)
 
-    assert len(basis_funcs) == 4*N, len(basis_funcs)
+    assert len(basis_funcs) == 2*(N-1)+1, len(basis_funcs)
     return basis_funcs
 
-def T2_basis(N: int, sigma: float=1.0, kappa: float=1.0, period1: float=1.0, period2=None) -> list:
-    '''Returns basis functions for T2 manifold'''
-    def weight_space_coefficients(m,n):
-        return sigma * jnp.sqrt(jnp.exp(- 2* jnp.pi**2 * kappa**2 * (m**2+n**2)))
-    if period2 is None:
-        period2 = period1
+# def T2_basis(N: int, sigma: float=1.0, kappa: float=1.0, period1: float=1.0, period2=None) -> list:
+#     '''Returns basis functions for T2 manifold'''
+#     def weight_space_coefficients(m,n):
+#         return sigma * jnp.sqrt(jnp.exp(- 2* jnp.pi**2 * kappa**2 * (m**2+n**2)))
+#     if period2 is None:
+#         period2 = period1
+
+#     basis_funcs = []
+#     for n in jnp.arange(-N, N):
+#         for m in jnp.arange(-N, N):
+#             def _f_sin(x, m=m, n=n): # defaults to avoid late binding
+#                 return weight_space_coefficients(m,n) * jnp.sin(2*jnp.pi * (m * x[0] / period1 + n * x[1] / period2))
+#             def _f_cos(x, m=m, n=n):
+#                 return weight_space_coefficients(m,n) * jnp.cos(2*jnp.pi * (m * x[0] / period1 + n * x[1] / period2))
+#             basis_funcs.append(_f_sin)
+#             basis_funcs.append(_f_cos)
+#     return basis_funcs
+
+def Tm_basis(N: int, M_conditions: int=1, sigma: float=1.0, kappa: float=1.0, period: jnp.ndarray | float = None) -> list:
+    '''
+    Regular Fourier Features sample approximation to GP over the M-dimensional torus.
+    For M=1, this is equivalent to T1_basis.
+    Args:
+        N: number of basis functions for each dimension (so total number of basis functions is 2*(N**M_conditions - 1) + 1)
+        M_conditions: number of conditions
+        sigma: kernel parameter
+        kappa: kernel parameter
+        period: period of the torus. Provide `period >= data_interval + 6 * kappa` for non-periodic data.
+    '''
+    def coef(index_array):
+        return jnp.sqrt(squared_exponential_spectral_measure(jnp.linalg.norm(index_array), sigma, kappa))
+    
+    if period is None:
+        period = jnp.ones(M_conditions)
+    if isinstance(period, float):
+        period = period * jnp.ones(M_conditions)
 
     basis_funcs = []
-    for n in jnp.arange(-N, N):
-        for m in jnp.arange(-N, N):
-            def _f_sin(x, m=m, n=n): # defaults to avoid late binding
-                return weight_space_coefficients(m,n) * jnp.sin(2*jnp.pi * (m * x[0] / period1 + n * x[1] / period2))
-            def _f_cos(x, m=m, n=n):
-                return weight_space_coefficients(m,n) * jnp.cos(2*jnp.pi * (m * x[0] / period1 + n * x[1] / period2))
+    for index in itertools.product(jnp.arange(N), repeat=M_conditions):
+        if index == (0,)*M_conditions:
+            constant_func = lambda x: coef(jnp.zeros(M_conditions)) * jnp.ones_like(x)
+            basis_funcs.append(constant_func) # only one constant function
+        else:
+            def _f_sin(x, index=index): # use defaults to avoid late binding
+                return coef(jnp.array(index)) * jnp.sin(2*jnp.pi * jnp.dot(jnp.array(index), jnp.divide(x, period)))
+            def _f_cos(x, index=index):
+                return coef(jnp.array(index)) * jnp.cos(2*jnp.pi * jnp.dot(jnp.array(index), jnp.divide(x, period)))
             basis_funcs.append(_f_sin)
             basis_funcs.append(_f_cos)
+
+    assert len(basis_funcs) == 2*(N**M_conditions - 1) + 1
     return basis_funcs
+
 
 # %%
 def logprob_analytic(
@@ -261,3 +308,55 @@ def psd_solve(A, b, diagonal_boost=1e-9):
 def safe_wrap(X):
     return jnp.where(jnp.isclose(X, 0.), 0., X)
 
+# %%
+def jax_solve_sylvester_BS(A, B, C, **kwargs):
+    """
+    Solve the Sylvester equation AX + XB = C for X using the Bartels-Stewart algorithm.
+    # WARNING: only implemented for A, B with real eigenvalues.
+    """
+    def solve_triangular_system(R, S, F):
+        """
+        Solve the triangular system RY + YS = C for Y using forward substitution on the blocks.
+        """
+        n = R.shape[0]
+        m = S.shape[0]
+        Y = jnp.zeros((n, m), dtype=C.dtype)
+        for k in range(m):
+            Y_k = jax.scipy.linalg.solve(R + S[k,k] * jnp.eye(n), F[:,k] - Y[:,k+1:] @ S[k+1:,k])
+            Y = Y.at[:,k].set(Y_k)
+        return Y
+    
+    # Compute the Schur decompositions of A and B
+    R, U = jax.scipy.linalg.schur(A)
+    S, V = jax.scipy.linalg.schur(B)
+
+    # Transform C into the Schur basis
+    F = U.T @ C @ V
+
+    # Solve the triangular system
+    Y = solve_triangular_system(R, S, F)
+
+    # Transform the solution back to the original basis
+    X = U @ Y @ V.T
+    return X
+
+def test_sylvester():
+    key = jax.random.PRNGKey(0)
+    dim_1, dim_2 = 3, 2
+    subkeys = jax.random.split(key, 3)
+    A = jax.random.normal(subkeys[0], (dim_1, dim_1))
+    B = jax.random.normal(subkeys[1], (dim_2, dim_2))
+    
+    # Make A and B have real eigenvalues only 
+    A = A + A.T
+    B = B + B.T
+
+    X = jax.random.normal(subkeys[2], (dim_1, dim_2))
+    C = A @ X + X @ B
+
+    X_hat = jax_solve_sylvester_BS(A, B, C)
+    assert jnp.allclose(X, X_hat, atol=1e-5), X - X_hat
+
+if __name__=='__main__':
+    M_conditions = 1
+    print(Tm_basis(5, 1, 1.0, 1.0))
