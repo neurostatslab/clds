@@ -7,29 +7,37 @@ from jaxtyping import Float, Array
 from scipy.stats import binned_statistic_2d
 from tqdm import tqdm 
 
-from models import ParamswGPLDS, wGPLDS
+from models import ParamsCLDS, CLDS
+
+def identifiability_transform(params):
+    '''
+    Given parameters of the model, return the linear transformation H
+    that makes Q = I, and its inverse Hinv. 
+    '''
+    U, S, _ = jnp.linalg.svd(params.Q)
+    H = U @ jnp.linalg.pinv(jnp.diag(jnp.sqrt(S))) @ U.T
+    Hinv = U @ jnp.diag(jnp.sqrt(S)) @ U.T
+    return H, Hinv
 
 # %%
 def get_fixed_points(
-        model, params: ParamswGPLDS, conditions_range: Float[Array, "T M"], ROTATE: bool=True,
+        model, params: ParamsCLDS, conditions_range: Float[Array, "T M"], ROTATE: bool=True,
         ) -> Float[Array, 'T state_dim']:
     '''
     Compute fixed points of the system, given parameters evaluated over condition range.
     Args:
-        params: ParamswGPLDS, the parameters of the model
+        params: ParamsCLDS, the parameters of the model
         conditions_range: Float[Array, "T M"], the range of conditions to evaluate the fixed points
         ROTATE: bool, whether to rotate the latent space (chosen so that Q becomes identity)
     '''
-    assert model.wgps['A'] and model.wgps['b'], 'A and b priors are required' 
-    As_conditions = model.wgps['A'](params.dynamics_gp_weights, conditions_range)
-    bs_conditions = model.wgps['b'](params.bias_gp_weights, conditions_range).squeeze()
+    # assert model.wgps['A'] and model.wgps['b'], 'A and b priors are required' 
+    # As_conditions = model.wgps['A'](params.dynamics_gp_weights, conditions_range)
+    # bs_conditions = model.wgps['b'](params.bias_gp_weights, conditions_range).squeeze()
+    As_conditions, _, bs_conditions, _ = model.weights_to_params(params, conditions_range)
 
     # Rotate
     if ROTATE:
-        _U, _S, _ = jnp.linalg.svd(params.Q)
-        H = jnp.linalg.pinv(jnp.diag(jnp.sqrt(_S))) @ _U.T
-        Hinv = _U @ jnp.diag(jnp.sqrt(_S))
-
+        H, Hinv = identifiability_transform(params)
         As_conditions = jnp.einsum('ij,tjk,kl->til', H, As_conditions, Hinv)
         bs_conditions = jnp.einsum('ij,tj->ti', H, bs_conditions)
 
@@ -38,26 +46,27 @@ def get_fixed_points(
         lambda t: jax.scipy.linalg.solve(jnp.eye(model.state_dim) - As_conditions[t], bs_conditions[t])
         )(jnp.arange(len(conditions_range)))
     
+    # if model.fixed_point_func is not None:
+    #     fixed_points = model.fixed_point_func(conditions_range)
+    
     return fixed_points
 
 # %%
 def compute_composite_dynamics(
-        model: wGPLDS, params: ParamswGPLDS, 
+        model: CLDS, params: ParamsCLDS, 
         conditions_range: Float[Array, "N M"], emissions: Float[Array, "B T emission_dim"], conditions: Float[Array, "B T M"],
-        ROTATE=True, n_bins=20
+        ROTATE=True, n_bins=20, pad=1.0
         ):
-    assert model.wgps['A'] and model.wgps['b'], 'A and b priors are required' 
+    # assert model.wgps['A'] and model.wgps['b'], 'A and b priors are required' 
     assert model.state_dim == 2, 'Only 2D latent space is supported'
 
-    _U, _S, _ = jnp.linalg.svd(params.Q)
-    H = jnp.linalg.pinv(jnp.diag(jnp.sqrt(_S))) @ _U.T
-    Hinv = _U @ jnp.diag(jnp.sqrt(_S))
-
+    H, Hinv = identifiability_transform(params)
+    
     # Create grid around fixed points
-    fixed_points = get_fixed_points(model, params, conditions_range)
+    fixed_points = get_fixed_points(model, params, conditions_range, ROTATE=ROTATE)
 
-    x_lims = (jnp.amin(fixed_points[:,0])-2, jnp.amax(fixed_points[:,0])+2)
-    y_lims = (jnp.amin(fixed_points[:,1])-2, jnp.amax(fixed_points[:,1])+2)
+    x_lims = (jnp.amin(fixed_points[:,0])-pad, jnp.amax(fixed_points[:,0])+pad)
+    y_lims = (jnp.amin(fixed_points[:,1])-pad, jnp.amax(fixed_points[:,1])+pad)
 
     x_bin_edges = jnp.linspace(*x_lims, n_bins)
     y_bin_edges = jnp.linspace(*y_lims, n_bins)
@@ -87,10 +96,12 @@ def compute_composite_dynamics(
         x_smooth_rot = jnp.einsum('ij,tj->ti', H, x_smooth) if ROTATE else x_smooth
 
         # MAP estimates of As and bs
-        batch_As = model.wgps['A'](params.dynamics_gp_weights, conditions[batch_id])
+        batch_As, _, batch_bs, _ = model.weights_to_params(params, conditions[batch_id])
+        batch_bs = batch_bs[..., None]
+        # batch_As = model.wgps['A'](params.dynamics_gp_weights, conditions[batch_id])
         batch_As_rot = jnp.einsum('ij,tjk,kl->til', H, batch_As, Hinv) if ROTATE else batch_As
 
-        batch_bs = model.wgps['b'](params.bias_gp_weights, conditions[batch_id])
+        # batch_bs = model.wgps['b'](params.bias_gp_weights, conditions[batch_id])
         batch_bs_rot = jnp.einsum('ij,tjk->tik', H, batch_bs) if ROTATE else batch_bs
 
         # Estimate parameters and statistics per bin
