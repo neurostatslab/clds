@@ -11,11 +11,11 @@ from jax import jit, value_and_grad, vmap
 from tqdm.auto import trange
 
 from params import ParamsGPLDS, \
-        ParamswGPLDS, \
+        ParamsCLDS, \
         ParamsGP, \
         ParamsBasis
         
-from models import wGPLDS, GPLDS
+from models import CLDS, GPLDS
 from functools import partial
 from jaxtyping import Array, Float
 from typing import Optional, NamedTuple
@@ -224,8 +224,8 @@ def fit_map(
 
 # %%
 def fit_em(
-        model: wGPLDS,
-        params: ParamswGPLDS,
+        model: CLDS,
+        params: ParamsCLDS,
         emissions: Float[Array, "num_batches num_timesteps emission_dim"],
         conditions: Optional[Float[Array, "num_batches num_timesteps input_dim"]]=None,
         num_iters: int=50,
