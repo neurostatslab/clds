@@ -265,7 +265,7 @@ def Tm_basis(N: int, M_conditions: int=1, sigma: float=1.0, kappa: float=1.0, pe
     basis_funcs = []
     for index in itertools.product(jnp.arange(N), repeat=M_conditions):
         if index == (0,)*M_conditions:
-            constant_func = lambda x: coef(jnp.zeros(M_conditions)) * jnp.ones_like(x)
+            constant_func = lambda x: coef(jnp.zeros(M_conditions))
             basis_funcs.append(constant_func) # only one constant function
         else:
             def _f_sin(x, index=index): # use defaults to avoid late binding
