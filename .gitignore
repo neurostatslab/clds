@@ -150,6 +150,7 @@ results/
 *.mp4
 *.png
 *.jpg
+figures/
 
 # Non-code manuscript files
 manuscript_files/
