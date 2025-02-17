@@ -24,7 +24,7 @@ from params import \
         ParamsEmission, \
         ParamsNormalLikelihood, \
         ParamsGPLDS, \
-        ParamswGPLDS
+        ParamsCLDS
 
 import utils
 
@@ -384,68 +384,87 @@ class GPLDS:
 # %%
 class WeightSpaceGaussianProcess():
     '''
-    Weight-space Gaussian Process prior
+    Weight-space Gaussian Process prior for matrix-valued random functions
+        A_ij(u) = \sum_l w^{(ij)} \phi_l(u),       w^{(ij)} ~ N(0, 1)
+    where w are the weights and \phi_l are the basis functions.
+    
+    Constants:
+        L: number of basis functions
+        D1: input dimension
+        D2: output dimension
+        M: dimension of u, the "conditions"
     '''
-    def __init__(self, basis_funcs, D1: int=1, D2: int=1):
+    def __init__(self, basis_funcs: list, D1: int=1, D2: int=1):
         self.basis_funcs = basis_funcs
+        self.L = len(basis_funcs)
         self.D1 = D1
         self.D2 = D2
 
     def __call__(self, 
-            weights: Float[Array, "len_basis D1 D2"], 
-            xs: Float[Array, "T M"]
+            weights: Float[Array, "L D1 D2"], 
+            conditions: Float[Array, "T M"]
         ) -> Float[Array, "T D1 D2"]:
         '''
-        Evaluate A_ij(x) = \sum_k w^{(ij)} \phi_k(x) at the M-dimensional points `xs`
-        with `weights` w^{(ij)} and basis functions \phi_k.
+        Evaluate A_ij(u) = \sum_l w^{(ij)} \phi_l(u) at the M-dimensional points u in `conditions`
+        with `weights` w^{(ij)} and basis functions \phi_l.
         '''
-        PhiX = self.evaluate_basis(xs)
-        return jnp.einsum('kij,tk->tij', weights, PhiX)
+        PhiX = self.evaluate_basis(conditions)
+        return jnp.einsum('lij,tl->tij', weights, PhiX)
     
-    def sample_weights(self, key: jxr.PRNGKey) -> Float[Array, "len_basis D1 D2"]:
-        return jxr.normal(key, shape=(len(self.basis_funcs), self.D1, self.D2))
+    def sample_weights(self, key: jxr.PRNGKey) -> Float[Array, "L D1 D2"]:
+        return jxr.normal(key, shape=(self.L, self.D1, self.D2))
     
-    def evaluate_basis(self, x: Float[Array, "T M"]) -> Float[Array, "T len_basis"]:
-        return jnp.array([jax.vmap(f)(x) for f in self.basis_funcs]).T
+    def evaluate_basis(self, u: Float[Array, "T M"]) -> Float[Array, "T L"]:
+        return jnp.array([jax.vmap(f)(u) for f in self.basis_funcs]).T
 
-    def sample(self, key: jxr.PRNGKey, xs: Float[Array, "T M"]) -> Float[Array, "T D1 D2"]:
+    def sample(self, key: jxr.PRNGKey, conditions: Float[Array, "T M"]) -> Float[Array, "T D1 D2"]:
         '''
-        Sample from the GP prior at the points `xs`
+        Sample from the GP prior at the points `conditions`
         '''
         weights = self.sample_weights(key)
-        PhiX = self.evaluate_basis(xs)
-        return self.__call__(weights, xs)
+        PhiX = self.evaluate_basis(conditions)
+        return self.__call__(weights, conditions)
     
-    def log_prob(self, xs: Float[Array, "T M"], fs: Float[Array, "T D1 D2"]) -> Float[Array, "D1 D2"]:
+    def log_prob(self, conditions: Float[Array, "T M"], fs: Float[Array, "T D1 D2"]) -> Float[Array, "D1 D2"]:
         '''
-        Compute the log probability of the GP draws at the time points `xs`
+        Compute the log probability of the GP draws at the points `conditions`
         '''
+        # Check dimensions
         if fs.ndim == 2:
             assert (self.D1 == 1) ^ (self.D2 == 1), 'Incorrect dimensions'
             fs = fs.reshape(-1, self.D1, self.D2)
         assert fs.shape[1] == self.D1 and fs.shape[2] == self.D2, 'Incorrect dimensions'
+        
+        # Compute log prob
         T = len(fs)
-        Phi = self.evaluate_basis(xs) # T x K
+        Phi = self.evaluate_basis(conditions) # T x L
         cov = jnp.dot(Phi, Phi.T)   # T x T
-        return dist.MultivariateNormal(jnp.zeros(T), covariance_matrix=cov).log_prob(fs.reshape(T,-1).T).reshape(self.D1, self.D2)
         # return jax.vmap(lambda _f: logprob_analytic(_f, jnp.zeros(T), cov), in_axes=(1))(fs.reshape(T, -1)).reshape(self.D1, self.D2)
 
-    def log_prob_weights(self, weights: Float[Array, "len_basis D1 D2"]) -> float:
+        model_dist = dist.MultivariateNormal(jnp.zeros(T), covariance_matrix=cov)
+        return model_dist.log_prob(fs.reshape(T,-1).T).reshape(self.D1, self.D2)
+
+    def log_prob_weights(self, weights: Float[Array, "L D1 D2"]) -> float:
         '''
-        Standard Gaussian prior on the weights
+        Standard Gaussian prior N(0,1) on the weights
         '''
         return -0.5 * jnp.sum(weights**2) - 0.5 * jnp.asarray(weights.shape).prod() * jnp.log(2*jnp.pi)
 
 # %%
-class wGPLDS():
+class CLDS():
     '''
-    GPLDS with weight-space view parametrization of the priors for the parameters {A, b, C}. 
-    By default: A has weight GP prior, whereas b and C are optional. 
-                If weight GP priors are not provided for b and C, they are learned as C fixed, b time-varying.
-    This is a early version, only currently supporting EM. Does not support sampling. Does not support inputs other than GP conditions. 
+    CLDS model, with weight-space view parametrization of the GP priors for the parameters {A, b, C, m0}.
+    
+    Init args:
+        wgps: dict of WeightSpaceGaussianProcess (wGP) objects for the parameters {A, b, C, m0}.
+        state_dim: dimension of the latent state space.
+        emission_dim: dimension of the observation space.
+    
+    By default: A has wGP prior, whereas b and C are optional. 
+                If wGP priors are not provided for b and C, they are learned as C fixed, b time-varying.
+    This is a early version, only currently supporting EM. Does not support sampling. Does not support inputs other than GP conditions.
     '''
     def __init__(self, wgps: dict, state_dim: int, emission_dim: int):
-        # TODO: Add other dynamics and emission models if we want to sample from it
         self.wgps = wgps
         assert 'A' in self.wgps, 'Dynamics GP prior is required'
         if 'b' not in self.wgps:
@@ -458,7 +477,7 @@ class wGPLDS():
         self.state_dim = state_dim
         self.emission_dim = emission_dim
 
-    def log_prior(self, params: ParamswGPLDS, inputs):
+    def log_prior(self, params: ParamsCLDS, inputs):
         '''Compute the log prior of the parameters. Conditions are inputs'''
         logprior_A = self.wgps['A'].log_prob_weights(params.dynamics_gp_weights)
 
@@ -489,7 +508,7 @@ class wGPLDS():
         m0 = self.wgps['m0'](params.m0_gp_weights, inputs)[0] if self.wgps['m0'] is not None else params.m0 #! Some unnecessary computation, keeping only t=0
         return As, Cs, bs.squeeze(), m0.squeeze()
 
-    def smoother(self, params: ParamswGPLDS, emissions, inputs):
+    def smoother(self, params: ParamsCLDS, emissions, inputs):
         '''inputs as conditions'''
         # Format params
         As, Cs, bs, m0 = self.weights_to_params(params, inputs)
@@ -510,7 +529,7 @@ class wGPLDS():
 
     def e_step(
         self,
-        params: ParamswGPLDS,
+        params: ParamsCLDS,
         emissions: Float[Array, "num_timesteps emission_dim"],
         inputs: Optional[Float[Array, "num_timesteps input_dim"]]=None,
     ):
@@ -530,8 +549,8 @@ class wGPLDS():
             ZTZ = jnp.einsum('tk,tij,tl->ikjl', _Phi, XTX, _Phi)
             ZTY = jnp.einsum('tk,tim->ikm', _Phi, XTY)
 
-            ZTZ = ZTZ.reshape(len(wgp_prior.basis_funcs) * wgp_prior.D2, len(wgp_prior.basis_funcs) * wgp_prior.D2)
-            ZTY = ZTY.reshape(len(wgp_prior.basis_funcs) * wgp_prior.D2, wgp_prior.D1)
+            ZTZ = ZTZ.reshape(wgp_prior.L * wgp_prior.D2, wgp_prior.L * wgp_prior.D2)
+            ZTY = ZTY.reshape(wgp_prior.L * wgp_prior.D2, wgp_prior.D1)
             return (ZTZ, ZTY)
 
         '''take inputs to be theta'''
@@ -631,9 +650,9 @@ class wGPLDS():
     
     def m_step(
             self,
-            params: ParamswGPLDS,
+            params: ParamsCLDS,
             batch_stats: Tuple, #inputs: Optional[Float[Array, "num_timesteps input_dim"]]=None,
-        ) -> ParamswGPLDS:
+        ) -> ParamsCLDS:
         def fit_linear_regression(ExxT, ExyT, EyyT, N):
             # Solve a linear regression given sufficient statistics
             W = utils.psd_solve(ExxT, ExyT).T
@@ -643,17 +662,17 @@ class wGPLDS():
         def fit_gplinear_regression(ZTZ, ZTY, wgp_prior):
             # Solve a linear regression in weight-space given sufficient statistics
             weights = jax.scipy.linalg.solve(
-                ZTZ + jnp.eye(len(wgp_prior.basis_funcs) * wgp_prior.D2), ZTY, 
+                ZTZ + jnp.eye(wgp_prior.L * wgp_prior.D2), ZTY, 
                 assume_a='pos'
                 )
-            weights = weights.reshape(wgp_prior.D2, len(wgp_prior.basis_funcs), wgp_prior.D1).transpose(1,2,0)
+            weights = weights.reshape(wgp_prior.D2, wgp_prior.L, wgp_prior.D1).transpose(1,2,0)
             return weights
         
         def fit_gplinear_regression_sylvester(ZTZ, Sigma, ZTY, wgp_prior):
             # Solve a linear regression in weight-space given sufficient statistics
             # weights = utils.jax_solve_sylvester(B, ZTZ, ZTY, assume_a='pos')
             weights = utils.jax_solve_sylvester_BS(ZTZ, Sigma, ZTY)
-            weights = weights.reshape(wgp_prior.D2, len(wgp_prior.basis_funcs), wgp_prior.D1).transpose(1,2,0)
+            weights = weights.reshape(wgp_prior.D2, wgp_prior.L, wgp_prior.D1).transpose(1,2,0)
             return weights
 
         # Sum the statistics across all batches
@@ -703,10 +722,6 @@ class wGPLDS():
         if self.wgps['C'] is None:
             W_C = None
             Cs = H_static
-
-            # print('Warning: Emission C is fixed')
-            # true_C = jxr.normal(jxr.PRNGKey(0), (self.emission_dim, 2)) # Overwrites neuron tuning
-            # Cs = jnp.tile(true_C, (100, 1, 1))
         else:
             # In weight space
             # W_C = fit_gplinear_regression(*wgpC_stats, self.wgps['C'])
@@ -716,10 +731,10 @@ class wGPLDS():
                 )
             Cs = None
 
-        # logger.warning('Warning, fixing R')
+        # logger.warning('Warning, fixing Q and R')
         # Q = jnp.eye(self.state_dim) # Can fix Q to be identity (for identifiability)
         # R = jnp.eye(self.emission_dim)
-        params = ParamswGPLDS(
+        params = ParamsCLDS(
             m0=m, S0=S, 
             dynamics_gp_weights=W_A, 
             bias_gp_weights=W_b, 

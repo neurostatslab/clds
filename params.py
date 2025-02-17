@@ -25,8 +25,7 @@ class ParamsGPLDS(NamedTuple):
     emissions:  ParamsEmission
     likelihood: ParamsNormalLikelihood
 
-
-class ParamswGPLDS(NamedTuple):
+class ParamsCLDS(NamedTuple):
     m0: Float[Array, "state_dim"]                               # Accessed if 'm0' wgp prior is None
     m0_gp_weights: Float[Array, "state_dim 1 len_basis"]
     S0: Float[Array, "state_dim state_dim"]
@@ -37,7 +36,6 @@ class ParamswGPLDS(NamedTuple):
     bs: Float[Array, "num_timesteps state_dim"]                 # Accessed if 'b' wgp prior is None
     Q: Float[Array, "state_dim state_dim"]
     R: Float[Array, "emission_dim emission_dim"]
-
 
 class ParamsBasis(NamedTuple):
     A_weights: Float[Array, "state_dim state_dim len_basis"]
