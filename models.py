@@ -453,7 +453,7 @@ class WeightSpaceGaussianProcess():
 # %%
 class CLDS():
     '''
-    Conditional Linear Dynamical System (CLDS) model, with LDS dynamics and 
+    Conditionally Linear Dynamical System (CLDS) model, with LDS dynamics and 
     weight-space view parametrization of the GP priors for the parameters {A, b, C, m0}.
     
     Init args:

@@ -1,7 +1,7 @@
-# Conditional Linear Dynamical Systems
+# Conditionally Linear Dynamical Systems
 
 Neural population activity exhibits complex, nonlinear dynamics, varying in time, over trials, and across experimental conditions. 
-Here, we develop Conditional Linear Dynamical System (CLDS) models as a general-purpose method to characterize these dynamics.
+Here, we develop Conditionally Linear Dynamical System (CLDS) models as a general-purpose method to characterize these dynamics.
 These models use Gaussian Process (GP) priors to capture the nonlinear dependence of circuit dynamics on task and behavioral variables. 
 Conditioned on these covariates, the data is modeled with linear dynamics. 
 This allows for transparent interpretation and tractable Bayesian inference. 
