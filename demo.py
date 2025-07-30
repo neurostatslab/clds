@@ -4,13 +4,13 @@
 @author: Amin
 """
 
-import models
+import clds.models as models
 import jax.numpy as jnp
 import jax
 
-import inference
+import clds.inference as inference
 import visualizations
-import utils
+import clds.utils as utils
 
 %load_ext autoreload
 %autoreload 2
