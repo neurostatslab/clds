@@ -73,7 +73,7 @@ class WeightSpaceGaussianProcess:
         with `weights` w^{(ij)} and basis functions \phi_l.
         """
         PhiX = self.evaluate_basis(conditions)
-        return jnp.einsum("lji,tl->tij", weights, PhiX)
+        return jnp.einsum("lji,tl->tji", weights, PhiX)
 
     def sample_weights(
         self, key: jxr.PRNGKey
@@ -82,8 +82,8 @@ class WeightSpaceGaussianProcess:
             key,
             shape=(
                 self.n_basis_funcs,
-                self.output_dim + self.include_bias,
-                self.input_dim,
+                self.output_dim,
+                self.input_dim + self.include_bias,
             ),
         )
 
@@ -144,7 +144,7 @@ class CLDS:
 
     Init args:
         wgps: dict of WeightSpaceGaussianProcess (wGP) objects for the parameters {A, b, C, m0}.
-        latent_dim: dimension of the latent state space.
+        state_dim: dimension of the latent state space.
         emission_dim: dimension of the observation space.
 
     By default: A has wGP prior, whereas b and C are optional.
@@ -152,7 +152,7 @@ class CLDS:
     This is a early version, only currently supporting EM. Does not support sampling. Does not support inputs other than GP conditions.
     """
 
-    def __init__(self, wgps: dict, latent_dim: int, emission_dim: int):
+    def __init__(self, wgps: dict, state_dim: int, emission_dim: int):
         self.wgps = wgps
         assert "A" in self.wgps, "Dynamics GP prior is required"
         if "b" not in self.wgps:
@@ -162,7 +162,7 @@ class CLDS:
         if "m0" not in self.wgps:
             self.wgps["m0"] = None
 
-        self.latent_dim = latent_dim
+        self.state_dim = state_dim
         self.emission_dim = emission_dim
 
     def log_prior(self, params: ParamsCLDS, inputs):
@@ -291,7 +291,7 @@ class CLDS:
         if self.wgps["m0"] is None:
             wgpm0_stats = None
         else:
-            m0_targets = Ex0.reshape(1, 1, self.latent_dim)
+            m0_targets = Ex0.reshape(1, 1, self.state_dim)
             XTX_m0 = jnp.ones((1, 1, 1))
 
             _cond = (
@@ -331,7 +331,7 @@ class CLDS:
         if self.wgps["b"] is None:
             bias_stats = (bias_targets, 1)
         else:
-            bias_targets = bias_targets.reshape(len(up), 1, self.latent_dim)
+            bias_targets = bias_targets.reshape(len(up), 1, self.state_dim)
             _XTXb = jnp.ones((len(up), 1, 1))
             bias_stats = weightspace_stats(_XTXb, bias_targets, self.wgps["b"], up)
 
@@ -377,7 +377,7 @@ class CLDS:
 
         def fit_gplinear_regression(ZTZ, ZTY, wgp_prior):
             # Solve a linear regression in weight-space given sufficient statistics
-            weights = jax.scipy.n_basis_funcsinalg.solve(
+            weights = jax.scipy.linalg.solve(
                 ZTZ + jnp.eye(wgp_prior.n_basis_funcs * wgp_prior.input_dim),
                 ZTY,
                 assume_a="pos",
@@ -467,7 +467,7 @@ class CLDS:
             Cs = None
 
         # logger.warning('Warning, fixing Q and R')
-        # Q = jnp.eye(self.latent_dim) # Can fix Q to be identity (for identifiability)
+        # Q = jnp.eye(self.state_dim) # Can fix Q to be identity (for identifiability)
         # R = jnp.eye(self.emission_dim)
         params = ParamsCLDS(
             m0=m,
@@ -513,7 +513,7 @@ class CLDS2:
     ----------
     priors :
         dict of WeightSpaceGaussianProcess (wGP) objects for the parameters {A, b, C, d, m0}.
-    latent_dim : int
+    state_dim : int
         dimension of the latent state space.
     emission_dim : int
         dimension of the observation space.
@@ -524,72 +524,172 @@ class CLDS2:
     This is a early version, only currently supporting EM. Does not support sampling. Does not support inputs other than GP conditions.
     """
 
-    def __init__(self, priors: dict, latent_dim: int, emission_dim: int):
+    def __init__(
+        self,
+        priors: dict,
+        state_dim: int,
+        emission_dim: int,
+        initial_params: Optional[ParamsCLDS2] = None,
+    ):
         self.priors = {
             "dynamics": None,
             "emissions": None,
             "init": None,
         }
         self.priors.update(priors)
-        self.latent_dim = latent_dim
+        self.use_dynamics_prior = self.priors["dynamics"] is not None
+        self.include_dynamics_bias = (
+            self.priors["dynamics"].include_bias if self.use_dynamics_prior else False
+        )
+        self.use_emissions_prior = self.priors["emissions"] is not None
+        self.include_emissions_bias = False
+        self.use_initial_prior = self.priors["init"] is not None
+        self.state_dim = state_dim
         self.emission_dim = emission_dim
+        self.initial_params = initial_params
         self.params = None
+
+    def initialize_params(self, num_samples, seed: int = 2):
+        Ab_key, Cd_key, m0_key = jxr.split(jxr.PRNGKey(seed), 3)
+        if self.use_dynamics_prior:
+            dynamics_weights = self.priors["dynamics"].sample_weights(Ab_key)
+            if self.include_dynamics_bias:
+                dynamics_bias = dynamics_weights[:, :, -1:]
+                dynamics_weights = dynamics_weights[:, :, :-1]
+            else:
+                dynamics_bias = jnp.zeros((num_samples, self.state_dim))
+        else:
+            dynamics_weights = jxr.normal(
+                Ab_key, (num_samples, self.state_dim, self.state_dim)
+            )
+            dynamics_bias = (
+                jxr.normal(Ab_key, (num_samples, self.state_dim, self.state_dim))
+                if self.include_dynamics_bias
+                else jnp.zeros((num_samples, self.state_dim))
+            )
+
+        if self.use_emissions_prior:
+            emissions_weights = self.priors["emissions"].sample_weights(Cd_key)
+            if self.include_emissions_bias:
+                emissions_bias = emissions_weights[:, :, -1:]
+                emissions_weights = emissions_weights[:, :, :-1]
+            else:
+                emissions_bias = jnp.zeros((num_samples, self.emission_dim))
+        else:
+            emissions_weights = jnp.tile(
+                jxr.normal(Cd_key, (self.emission_dim, self.state_dim)),
+                (num_samples, 1, 1),
+            )
+            emissions_bias = (
+                jxr.normal(Cd_key, (num_samples, self.emission_dim))
+                if self.include_emissions_bias
+                else jnp.zeros((num_samples, self.emission_dim))
+            )
+
+        if self.use_initial_prior:
+            initial_mean = self.priors["init"].sample_weights(m0_key)
+        else:
+            initial_mean = jxr.normal(m0_key, (num_samples, self.state_dim))
+
+        return ParamsCLDS2(
+            dynamics_weights=dynamics_weights,
+            dynamics_bias=dynamics_bias,
+            emissions_weights=emissions_weights,
+            emissions_bias=emissions_bias,
+            initial_mean=initial_mean,
+            initial_cov=jnp.eye(self.state_dim),
+            dynamics_cov=jnp.eye(self.state_dim),
+            emissions_cov=jnp.eye(self.emission_dim),
+        )
+
+    def sample_dynamics(
+        self, inputs: Float[Array, "num_timesteps input_dim"], seed: int = 2
+    ):
+        As, Cs, bs, ds, m0 = self.weights_to_params(self.params, inputs)
+        key = jxr.PRNGKey(seed)
+
+        def f(x, args):
+            A, b, C, d, (em_key, dy_key) = args
+
+            emissions_noise = jxr.multivariate_normal(
+                em_key, jnp.zeros(self.emission_dim), self.params.emissions_cov
+            )
+            y = C @ x + d + emissions_noise
+
+            dynamics_noise = jxr.multivariate_normal(
+                dy_key, jnp.zeros(self.state_dim), self.params.dynamics_cov
+            )
+            x_next = A @ x + b + dynamics_noise
+            return x_next, (x_next, y)
+
+        x_init = jxr.multivariate_normal(key, m0, self.params.initial_cov)
+        subkeys = jxr.split(key, num=(As.shape[0], 2))
+        _, (x_nexts, ys) = jax.lax.scan(f, x_init, xs=(As, bs, Cs, ds, subkeys))
+        xs = jnp.concatenate((x_init[None, :], x_nexts[:-1]), axis=0)
+        return xs, ys
 
     def log_prior(self, params: ParamsCLDS2, inputs):
         """Compute the log prior of the parameters. Conditions are inputs"""
 
-        if self.priors["dynamics"] is None:
-            logprior_Ab = 0.0
-        else:
+        if self.use_dynamics_prior:
             logprior_Ab = self.priors["dynamics"].log_prob_weights(
-                jnp.concatenate((params.dynamics_matrix, params.dynamics_bias), axis=1)
-            )
-
-        if self.priors["emissions"] is None:
-            logprior_Cd = 0.0
-        else:
-            logprior_Cd = self.priors["emissions"].log_prob_weights(
                 jnp.concatenate(
-                    (params.emissions_matrix, params.emissions_bias), axis=1
+                    (params.dynamics_weights, params.dynamics_bias), axis=-1
                 )
             )
-
-        if self.priors["init"] is None:
-            logprior_m0 = 0.0
         else:
-            logprior_m0 = self.priors["init"].log_prob_weights(params.init_mean)
+            logprior_Ab = 0.0
+
+        if self.use_emissions_prior:
+            if self.include_emissions_bias:
+                logprior_Cd = self.priors["emissions"].log_prob_weights(
+                    jnp.concatenate(
+                        (params.emissions_weights, params.emissions_bias), axis=-1
+                    )
+                )
+            else:
+                logprior_Cd = self.priors["emissions"].log_prob_weights(
+                    params.emissions_weights
+                )
+        else:
+            logprior_Cd = 0.0
+
+        if self.use_initial_prior:
+            logprior_m0 = self.priors["init"].log_prob_weights(params.initial_mean)
+        else:
+            logprior_m0 = 0.0
 
         return logprior_Ab + logprior_Cd + logprior_m0
 
     def weights_to_params(self, params, inputs):
         """Transform weights of weight space into parameters.
         Implement as needed for all weight-space GP priors."""
-        if self.priors["dynamics"] is None:
-            As = params.dynamics_matrix
-            bs = params.dynamics_bias
-        else:
-            As = self.priors["dynamics"](params.dynamics_matrix, inputs)
+        if self.use_dynamics_prior:
+            As = self.priors["dynamics"](params.dynamics_weights, inputs)
             bs = (
                 self.priors["dynamics"](params.dynamics_bias, inputs)
                 if self.priors["dynamics"].include_bias
-                else jnp.zeros((As.shape[0], As.shape[-1]))
+                else jnp.zeros((inputs.shape[0], self.priors["dynamics"].output_dim))
             )
-
-        if self.priors["emissions"] is None:
-            Cs = params.emissions_matrix
-            ds = params.emissions_bias
         else:
-            Cs = self.priors["emissions"](params.emissions_matrix, inputs)
+            As = params.dynamics_weights
+            bs = params.dynamics_bias
+
+        if self.use_emissions_prior:
+            Cs = self.priors["emissions"](params.emissions_weights, inputs)
             ds = (
                 self.priors["emissions"](params.emissions_bias, inputs)
                 if self.priors["emissions"].include_bias
-                else jnp.zeros(Cs.shape[0], Cs.shape[-1])
+                else jnp.zeros((inputs.shape[0], self.priors["emissions"].output_dim))
             )
+        else:
+            Cs = jnp.tile(params.emissions_weights, (inputs.shape[0], 1, 1))
+            ds = params.emissions_bias
 
         m0 = (
-            self.priors["init"](params.init_mean, inputs)[0]
-            if self.priors["init"] is not None
-            else params.init_mean
+            self.priors["init"](params.initial_mean, inputs)[0]
+            if self.use_initial_prior
+            else params.initial_mean
         )  #! Some unnecessary computation, keeping only t=0
         return As, Cs, bs.squeeze(), ds.squeeze(), m0.squeeze()
 
@@ -603,7 +703,7 @@ class CLDS2:
         # Run the smoother
         lgssm_params = {
             "m0": m0,
-            "S0": params.init_cov,
+            "S0": params.initial_cov,
             "As": As,
             "bs": bs,
             "Q": params.dynamics_cov,
@@ -644,6 +744,35 @@ class CLDS2:
             )
             return (ZTZ, ZTY)
 
+        def weightspace_stats2(
+            basis: Float[Array, "n_steps n_basis_funcs"],
+            XTX: Float[Array, "n_steps input_dim input_dim"] = None,
+            XTY: Float[Array, "n_steps input_dim output_dim"] = None,
+        ) -> tuple:
+            """
+            Compute the expected sufficient statistics for the weight-space GP prior.
+            Provide the sufficient stats X^T X and X^T Y for the problem Y = A(C)X + noise.
+            This returns the expanded stats Phi @ X^T X @ Phi^T and Phi @ X^T Y for the basis functions Phi(C).
+            """
+            n_basis_funcs = basis.shape[-1]
+
+            if XTX is not None:
+                input_dim = XTX.shape[-1]
+                ZTZ = jnp.einsum("tk,tl,tij->kilj", _Phi, _Phi, XTX).reshape(
+                    -1,
+                    n_basis_funcs * input_dim,
+                )
+            else:
+                ZTZ = None
+
+            if XTY is not None:
+                output_dim = XTY.shape[-1]
+                ZTY = jnp.einsum("tk,tim->kim", _Phi, XTY).reshape(-1, output_dim)
+            else:
+                ZTY = None
+
+            return ZTZ, ZTY
+
         """take inputs to be theta"""
         num_timesteps = emissions.shape[0]
         if inputs is None:
@@ -669,16 +798,16 @@ class CLDS2:
         # Append bias to the inputs
         # inputs = jnp.concatenate((inputs, jnp.ones((num_timesteps, 1))), axis=1)
         up = inputs[:-1]
+        # upb = jnp.concatenate((up, jnp.ones((num_timesteps - 1, 1))), axis=1)
+        upb = jnp.vstack((up, jnp.ones((num_timesteps - 1)))).T
         # u = inputs
 
         # expected sufficient statistics for the initial distribution
         Ex0 = smoothed_means[0]
         Ex0x0T = smoothed_covariances[0] + jnp.outer(Ex0, Ex0)
         init_stats = (Ex0, Ex0x0T, 1)
-        if self.priors["init"] is None:
-            wgpm0_stats = None
-        else:
-            m0_targets = Ex0.reshape(1, 1, self.latent_dim)
+        if self.use_initial_prior:
+            m0_targets = Ex0.reshape(1, 1, self.state_dim)
             XTX_m0 = jnp.ones((1, 1, 1))
 
             _cond = (
@@ -687,109 +816,99 @@ class CLDS2:
             wgpm0_stats = weightspace_stats(
                 XTX_m0, m0_targets, self.priors["init"], _cond
             )
+        else:
+            wgpm0_stats = None
 
         # expected sufficient statistics for the dynamics
         # let zp[t] = [x[t], u[t]] for t = 0...T-2
         # let xn[t] = x[t+1]          for t = 0...T-2
-        sum_xpxnT = Expxn.sum(0)
         sum_xpxpT = Vxp.sum(0) + Exp.T @ Exp
+        sum_xpT = Exp.T @ upb
+        sum_xpxpT = jnp.block([[sum_xpxpT, sum_xpT], [sum_xpT.T, upb.T @ upb]])
+        sum_xpxnT = jnp.block([[Expxn.sum(0)], [upb.T @ Exn]])
+        # sum_xpxnT = Expxn.sum(0)
         sum_xnxnT = Vxn.sum(0) + Exn.T @ Exn
         dynamics_stats = (sum_xpxpT, sum_xpxnT, sum_xnxnT, num_timesteps - 1)
 
         # full E-step sufficient stats
-        ExpxpT = jnp.einsum("ti,tj->tij", Exp, Exp) + Vxp
-        _Phi = self.priors["dynamics"].evaluate_basis(up)
+        if self.use_dynamics_prior:
+            ExpxpT = jnp.einsum("ti,tj->tij", Exp, Exp) + Vxp
+            _Phi = self.priors["dynamics"].evaluate_basis(up)
 
-        # W_a terms
-        # (T x L) (T x L) (T x D2 X D2) -> (LD2 x LD2)
-        # (T x L) (T x D2 x D2) (T x L) -> (L x D2 x D2 x L)
-        N1T = jnp.einsum("tk,tl,tij->kilj", _Phi, _Phi, ExpxpT).reshape(
-            -1,
-            self.priors["dynamics"].n_basis_funcs * self.priors["dynamics"].input_dim,
-        )
-        # (T x L) (T x D2 x D1) -> (LD2 x D1)
-        # (L x D2 x D1)
-        NDel = jnp.einsum("tk,tim->kim", _Phi, Expxn).reshape(
-            -1, self.priors["dynamics"].output_dim
-        )
-
-        # b / W_b terms
-        if self.priors["dynamics"] is None:
-            # (T x L) (T x D2) -> (1 x LD2)
-            PhiTZ = jnp.einsum("tl,ti->li", _Phi, Exp).reshape(
-                1,
-                self.priors["dynamics"].output_dim * self.priors["dynamics"].input_dim,
+            # (LD2 x LD2), (LD2 x D1)
+            sum_zpzpT, sum_zpxnT = weightspace_stats2(_Phi, XTX=ExpxpT, XTY=Expxn)
+            if self.include_dynamics_bias:
+                # (L x LD2), (L x D1)
+                sum_zpT, sum_znT = weightspace_stats2(
+                    _Phi, XTX=Exp[:, None, :], XTY=Exn[:, None, :]
+                )
+                # ((LD2+L) x (LD2+L)))
+                sum_zpzpT = jnp.block(
+                    [
+                        [sum_zpzpT, sum_zpT.T],
+                        [sum_zpT, jnp.einsum("tk,tl->kl", _Phi, _Phi)],
+                    ]
+                )
+                # ((LD2+L) x D1)
+                sum_zpxnT = jnp.concatenate([sum_zpxnT, sum_znT], axis=0)
+            dynamics_sylvester_stats = (
+                sum_zpzpT,
+                params.dynamics_cov,
+                sum_zpxnT,
+                sum_xnxnT,
+                num_timesteps - 1,
             )
-            # (1 x 1)
-            _PhiTPhi = jnp.ones((1, 1))
-            # (1 X D1)
-            PhiTX = Exn.sum(axis=0).reshape(1, -1)
-        else:
-            # (T x L) (T x L) (T x D2) -> (L x LD2)
-            # (T x L) (T x 1 x D2) (T x L) -> (L x 1 X D2 x L)
-            PhiTZ = jnp.einsum("tk,tl,ti->kli", _Phi, _Phi, Exp).reshape(
-                -1,
-                self.priors["dynamics"].n_basis_funcs
-                * self.priors["dynamics"].input_dim,
-            )
-            # (T x L) (T x L) -> (L x L)
-            _PhiTPhi = jnp.einsum("tk,tl->kl", _Phi, _Phi)
-            # (T x L) (T x D1) -> (L x D1)
-            # (T x L) (T x 1 x D1) -> (L x 1 x D1)
-            PhiTX = jnp.einsum("tk,tm->km", _Phi, Exn)
-        # (LD2 x L)
-        # or (LD2 x 1)
-        ZTPhi = PhiTZ.T
-
-        ## sylvester equation stats
-        ##-- A --##
-        # left --
-        # ((LD2+L) x LD2) for W_b
-        # or ((LD2+1) x LD2) for b
-        AL = jnp.concatenate((N1T, PhiTZ), axis=0)
-        # right --
-        # ((LD2+L) x L) for W_b
-        # or ((LD2+1) x 1) for b
-        AR = jnp.concatenate((ZTPhi, _PhiTPhi), axis=0)
-        # combine --
-        # ((LD2+L) x (LD2+L)))) for W_b
-        # or ((LD2+1) x (LD2+1)) for b
-        A = jnp.concatenate((AL, AR), axis=-1)
-
-        ##-- B --##
-        B = params.dynamics_cov
-
-        ##-- C --##
-        # ((LD2+L) x D1) for W_b
-        # or ((LD2+1) x D1) for b
-        C = jnp.concatenate((NDel, PhiTX), axis=0)
-        Ab_sylvester_stats = (A, B, C)
 
         # more expected sufficient statistics for the emissions
         y = emissions
         sum_xxT = Vx.sum(0) + Ex.T @ Ex
         sum_xyT = Ex.T @ y
         sum_yyT = emissions.T @ emissions
+
+        if self.include_emissions_bias:
+            ub = jnp.vstack((inputs, jnp.ones((num_timesteps)))).T
+            sum_xT = Ex.T @ ub
+            sum_xxT = jnp.block([[sum_xxT, sum_xT], [sum_xT.T, ub.T @ ub]])
+            sum_xyT = jnp.block([[sum_xyT], [ub.T @ y]])
+
         emission_stats = (sum_xxT, sum_xyT, sum_yyT, num_timesteps)
 
-        if self.priors["emissions"] is None:
-            wgpC_stats = None
-            wgpC_sylvester_stats = None
-        else:
-            _xxT = jnp.einsum("ti,tj->tij", Ex, Ex) + Vx
-            _xyT = jnp.einsum("ti,tj->tij", Ex, y)
-            wgpC_stats = weightspace_stats(_xxT, _xyT, self.priors["emissions"], inputs)
+        if self.use_emissions_prior:
+            _Phi = self.priors["emissions"].evaluate_basis(inputs)
+            ExxT = jnp.einsum("ti,tj->tij", Ex, Ex) + Vx
+            ExyT = jnp.einsum("ti,tj->tij", Ex, y)
+            sum_zzT, sum_zyT = weightspace_stats2(_Phi, ExxT, ExyT)
 
-            wgpC_sylvester_stats = (wgpC_stats[0], params.R, wgpC_stats[1], 1)
+            if self.include_emissions_bias:
+                sum_zT, sum_yT = weightspace_stats2(
+                    _Phi, XTX=Ex[:, None, :], XTY=y[:, None, :]
+                )
+                sum_zzT = jnp.block(
+                    [
+                        [sum_zzT, sum_zT.T],
+                        [sum_zT, jnp.einsum("tk,tl->kl", _Phi, _Phi)],
+                    ]
+                )
+                sum_zyT = jnp.concatenate([sum_zyT, sum_yT], axis=0)
+
+            emissions_sylvester_stats = (
+                sum_zzT,
+                params.emissions_cov,
+                sum_zyT,
+                sum_yyT,
+                num_timesteps,
+            )
+
+        else:
+            emissions_sylvester_stats = None
 
         return (
             init_stats,
             wgpm0_stats,
             dynamics_stats,
             emission_stats,
-            wgpC_stats,
-            wgpC_sylvester_stats,
-            Ab_sylvester_stats,
+            emissions_sylvester_stats,
+            dynamics_sylvester_stats,
         ), marginal_loglik
 
     def m_step(
@@ -824,63 +943,64 @@ class CLDS2:
             ).transpose(1, 2, 0)
             return weights
 
+        def fit_gplinear_regression_sylvester2(
+            ZTZ, Sigma, ZTY, YTY, N, wgp_prior, use_bias
+        ):
+            # Solve a linear regression in weight-space given sufficient statistics
+            # weights = utils.jax_solve_sylvester(B, ZTZ, ZTY, assume_a='pos')
+            weights = utils.jax_solve_sylvester_BS(ZTZ, Sigma, ZTY)
+            Sigma = (
+                YTY - weights.T @ ZTY - ZTY.T @ weights + weights.T @ ZTZ @ weights
+            ) / N
+            if use_bias:
+                bias = weights[wgp_prior.n_basis_funcs * wgp_prior.input_dim :].reshape(
+                    wgp_prior.n_basis_funcs, wgp_prior.output_dim, 1
+                )
+                weights = (
+                    weights[: wgp_prior.n_basis_funcs * wgp_prior.input_dim]
+                    .reshape(
+                        wgp_prior.n_basis_funcs,
+                        wgp_prior.input_dim,
+                        wgp_prior.output_dim,
+                    )
+                    .transpose(0, 2, 1)
+                )
+            else:
+                bias = None
+                weights = weights.reshape(
+                    wgp_prior.n_basis_funcs, wgp_prior.input_dim, wgp_prior.output_dim
+                ).transpose(0, 2, 1)
+
+            return weights, bias, Sigma
+
         # Sum the statistics across all batches
-        stats = jax.tree_util.tree_map(partial(jnp.mean, axis=0), batch_stats)
+        stats = jax.tree_util.tree_map(partial(jnp.sum, axis=0), batch_stats)
         (
             init_stats,
             wgpm0_stats,
             dynamics_stats,
             emission_stats,
-            wgpC_stats,
-            wgpC_sylvester_stats,
+            Cd_sylvester_stats,
             Ab_sylvester_stats,
         ) = stats
 
         # Perform MLE estimation jointly
         sum_x0, sum_x0x0T, N = init_stats
         S = sum_x0x0T / N - jnp.outer(sum_x0, sum_x0) / (N**2)
-        if self.priors["init"] is None:
-            m = sum_x0 / N
-        else:
+        if self.use_initial_prior:
             m = fit_gplinear_regression(*wgpm0_stats, self.priors["init"])
+        else:
+            m = sum_x0 / N
 
         # Dynamics M-step
-        F_static, Q = fit_linear_regression(*dynamics_stats)
+        # F_static, Q = fit_linear_regression(*dynamics_stats)
 
         # flip input and output dimensions
-        weights = utils.jax_solve_sylvester_BS(*Ab_sylvester_stats)
-        As = (
-            weights[
-                : (
-                    self.priors["dynamics"].n_basis_funcs
-                    * self.priors["dynamics"].input_dim
-                )
-            ]
-            .reshape(
-                self.priors["dynamics"].n_basis_funcs,
-                self.priors["dynamics"].input_dim,
-                self.priors["dynamics"].output_dim,
-            )
-            .transpose(0, 2, 1)
+        As, bs, Q = fit_gplinear_regression_sylvester2(
+            *Ab_sylvester_stats,
+            self.priors["dynamics"],
+            self.include_dynamics_bias,
         )
-        if self.priors["dynamics"] is None:
-            bs = weights[
-                (
-                    self.priors["dynamics"].n_basis_funcs
-                    * self.priors["dynamics"].input_dim
-                ) :
-            ]
-        else:
-            bs = weights[
-                (
-                    self.priors["dynamics"].n_basis_funcs
-                    * self.priors["dynamics"].input_dim
-                ) :
-            ].reshape(
-                self.priors["dynamics"].n_basis_funcs,
-                1,
-                self.priors["dynamics"].output_dim,
-            )
 
         # # Use the following for homogeneous bias
         # b = jnp.mean(bs, axis=0)
@@ -888,28 +1008,33 @@ class CLDS2:
 
         # Emission M-step
         H_static, R = fit_linear_regression(*emission_stats)
-        if self.priors["emissions"] is None:
-            Cs = H_static
-        else:
+        if self.use_emissions_prior:
             # In weight space
             # W_C = fit_gplinear_regression(*wgpC_stats, self.wgps['C'])
-            Cs = fit_gplinear_regression_sylvester(
-                wgpC_sylvester_stats[0],
-                wgpC_sylvester_stats[1] / wgpC_sylvester_stats[3],
-                wgpC_sylvester_stats[2],
-                wgp_prior=self.priors["emissions"],
+            Cs, ds, R = fit_gplinear_regression_sylvester2(
+                *Cd_sylvester_stats,
+                self.priors["emissions"],
+                self.include_emissions_bias,
             )
+            # fit_gplinear_regression_sylvester(
+            #     wgpC_sylvester_stats[0],
+            #     wgpC_sylvester_stats[1] / wgpC_sylvester_stats[3],
+            #     wgpC_sylvester_stats[2],
+            #     wgp_prior=self.priors["emissions"],
+            # )
+        else:
+            Cs = H_static
 
         # logger.warning('Warning, fixing Q and R')
-        # Q = jnp.eye(self.latent_dim) # Can fix Q to be identity (for identifiability)
+        # Q = jnp.eye(self.state_dim) # Can fix Q to be identity (for identifiability)
         # R = jnp.eye(self.emission_dim)
         params = ParamsCLDS2(
-            init_mean=m,
-            init_cov=S,
-            dynamics_matrix=As,
+            initial_mean=m,
+            initial_cov=S,
+            dynamics_weights=As,
             dynamics_bias=bs,
             dynamics_cov=Q,
-            emissions_matrix=Cs,
+            emissions_weights=Cs,
             emissions_bias=params.emissions_bias,
             emissions_cov=R,
         )

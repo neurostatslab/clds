@@ -122,7 +122,9 @@ def compute_composite_dynamics(
         x_smooth_rot = jnp.einsum("ij,tj->ti", H, x_smooth) if ROTATE else x_smooth
 
         # MAP estimates of As and bs
-        batch_As, _, batch_bs, _ = model.weights_to_params(params, conditions[batch_id])
+        batch_As, _, batch_bs, _, _ = model.weights_to_params(
+            params, conditions[batch_id]
+        )
         batch_bs = batch_bs[..., None]
         # batch_As = model.wgps['A'](params.dynamics_gp_weights, conditions[batch_id])
         batch_As_rot = (

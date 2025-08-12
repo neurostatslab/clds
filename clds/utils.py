@@ -112,8 +112,8 @@ def lgssm_filter(
     bs: Float[Array, "ntime-1 latent_dim"],  # dynamics biases
     Cs: Float[Array, "ntime emission_dim latent_dim"],  # emission matrices
     R: Float[Array, "emission_dim emission_dim"],  # emission covariance
-    ds: Float[Array, "ntime emission_dim"],  # emissions biases
     ys: Float[Array, "ntime emission_dim"],
+    ds: Float[Array, "ntime emission_dim"] = None,  # emissions biases
 ):
     r"""Run a Kalman filter to produce the marginal likelihood and filtered state estimates.
     Copied and adapted from dynamax.
@@ -145,12 +145,20 @@ def lgssm_filter(
         y = ys[t]
 
         # Update the log likelihood
-        ll += _log_likelihood(pred_mean, pred_cov, Cs[t], ds[t], R, y)
+        if ds is None:
+            ll += _log_likelihood(pred_mean, pred_cov, Cs[t], 0, R, y)
+        else:
+            ll += _log_likelihood(pred_mean, pred_cov, Cs[t], ds[t], R, y)
 
         # Condition on this emission
-        filtered_mean, filtered_cov = _condition_on(
-            pred_mean, pred_cov, Cs[t], ds[t], R, y
-        )
+        if ds is None:
+            filtered_mean, filtered_cov = _condition_on(
+                pred_mean, pred_cov, Cs[t], 0, R, y
+            )
+        else:
+            filtered_mean, filtered_cov = _condition_on(
+                pred_mean, pred_cov, Cs[t], ds[t], R, y
+            )
 
         # Predict the next state
         pred_mean, pred_cov = _predict(filtered_mean, filtered_cov, As[t], bs[t], Q)
@@ -173,8 +181,8 @@ def lgssm_smoother(
     bs: Float[Array, "ntime latent_dim"],  # dynamics biases
     Cs: Float[Array, "ntime emission_dim latent_dim"],  # emission matrices
     R: Float[Array, "emission_dim emission_dim"],  # emission covariance
-    ds: Float[Array, "ntime emission_dim"],  # emissions biases
     ys: Float[Array, "ntime emission_dim"],  # emissions
+    ds: Float[Array, "ntime emission_dim"] = None,  # emissions biases
 ):
     num_timesteps = len(ys)
 

@@ -50,7 +50,7 @@ class Basis(Recognition):
 # %%
 def fit_em(
     model: CLDS,
-    params: ParamsCLDS,
+    # params: ParamsCLDS,
     emissions: Float[Array, "num_batches num_timesteps emission_dim"],
     conditions: Optional[Float[Array, "num_batches num_timesteps input_dim"]] = None,
     num_iters: int = 50,
@@ -61,6 +61,11 @@ def fit_em(
     assert (
         emissions.ndim == 3
     ), "emissions should be 3D, of shape (num_batches, num_timesteps, emission_dim)"
+
+    if model.initial_params is None:
+        model.initial_params = model.initialize_params(emissions.shape[1])
+
+    params = model.initial_params
 
     @jit
     def em_step(params):
@@ -100,4 +105,5 @@ def fit_em(
             f"Iter {i+1}/{num_iters}, log-prob = {log_prob:.2f}, marginal log-lik = {marginal_log_lik:.2f}"
         )
 
+    model.params = params
     return params, log_probs

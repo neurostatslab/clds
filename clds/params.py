@@ -44,9 +44,11 @@ class ParamsCLDS(NamedTuple):
 
 
 class ParamsCLDS2(NamedTuple):
-    init_mean: Union[Float[Array, "state_dim"], Float[Array, "state_dim 1 len_basis"]]
-    init_cov: Float[Array, "state_dim state_dim"]
-    dynamics_matrix: Union[
+    initial_mean: Union[
+        Float[Array, "state_dim"], Float[Array, "state_dim 1 len_basis"]
+    ]
+    initial_cov: Float[Array, "state_dim state_dim"]
+    dynamics_weights: Union[
         Float[Array, "len_basis state_dim state_dim"],  # W_b
         Float[Array, "num_timesteps state_dim state_dim"],  # A_t
     ]
@@ -55,7 +57,7 @@ class ParamsCLDS2(NamedTuple):
         Float[Array, "num_timesteps state_dim"],  # b_t
     ]
     dynamics_cov: Float[Array, "state_dim state_dim"]  # Q
-    emissions_matrix: Float[Array, "num_timesteps emission_dim state_dim"]
+    emissions_weights: Float[Array, "num_timesteps emission_dim state_dim"]
     emissions_bias: Float[Array, "num_timesteps emission_dim"]  # ds
     emissions_cov: Float[Array, "emission_dim emission_dim"]  # R
 
