@@ -50,10 +50,11 @@ class Basis(Recognition):
 # %%
 def fit_em(
     model: CLDS,
-    # params: ParamsCLDS,
+    initial_params: ParamsCLDS,
     emissions: Float[Array, "num_batches num_timesteps emission_dim"],
     conditions: Optional[Float[Array, "num_batches num_timesteps input_dim"]] = None,
     num_iters: int = 50,
+    seed: int = 2,
 ):
     """
     Requires the model to have the e_step and m_step functions implemented
@@ -62,10 +63,13 @@ def fit_em(
         emissions.ndim == 3
     ), "emissions should be 3D, of shape (num_batches, num_timesteps, emission_dim)"
 
-    if model.initial_params is None:
-        model.initial_params = model.initialize_params(emissions.shape[1])
+    if initial_params is None:
+        if model.initial_params is None:
+            model.initial_params = model.initialize_params(emissions.shape[1], seed)
 
-    params = model.initial_params
+        params = model.initial_params
+    else:
+        params = initial_params
 
     @jit
     def em_step(params):
