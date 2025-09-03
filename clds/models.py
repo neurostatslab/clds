@@ -99,7 +99,6 @@ class WeightSpaceGaussianProcess:
         Sample from the GP prior at the points `conditions`
         """
         weights = self.sample_weights(key)
-        PhiX = self.evaluate_basis(conditions)
         return self.__call__(weights, conditions)
 
     # def log_prob(
@@ -529,21 +528,23 @@ class CLDS2:
         state_dim: int,
         emission_dim: int,
         basis_funcs: list,
-        use_dynamics_prior: bool = True,
+        # use_dynamics_prior: bool = True,
         use_emissions_prior: bool = True,
         use_initial_prior: bool = True,
-        include_dynamics_bias: bool = True,
-        include_emissions_bias: bool = False,
+        use_dynamics_bias: bool = True,
+        use_emissions_bias: bool = False,
         initial_params: Optional[ParamsCLDS2] = None,
     ):
         # store parameters and flags
-        self.use_dynamics_prior = use_dynamics_prior
-        self.include_dynamics_bias = include_dynamics_bias
-        self.use_emissions_prior = use_emissions_prior
-        self.include_emissions_bias = include_emissions_bias
-        self.use_initial_prior = use_initial_prior
         self.state_dim = state_dim
         self.emission_dim = emission_dim
+
+        # self.use_dynamics_prior = use_dynamics_prior
+        self.use_dynamics_bias = use_dynamics_bias
+        self.use_emissions_prior = use_emissions_prior
+        self.use_emissions_bias = use_emissions_bias
+        self.use_initial_prior = use_initial_prior
+
         self.initial_params = initial_params
         self.params = None
 
@@ -557,19 +558,19 @@ class CLDS2:
             "emissions": None,
             "init": None,
         }
-        if self.use_dynamics_prior:
-            priors["dynamics"] = WeightSpaceGaussianProcess(
-                basis_funcs=basis_funcs,
-                input_dim=self.state_dim,
-                output_dim=self.state_dim,
-                include_bias=self.include_dynamics_bias,
-            )
+        # always use dynamics prior
+        priors["dynamics"] = WeightSpaceGaussianProcess(
+            basis_funcs=basis_funcs,
+            input_dim=self.state_dim,
+            output_dim=self.state_dim,
+            include_bias=self.use_dynamics_bias,
+        )
         if self.use_emissions_prior:
             priors["emissions"] = WeightSpaceGaussianProcess(
                 basis_funcs=basis_funcs,
                 input_dim=self.state_dim,
                 output_dim=self.emission_dim,
-                include_bias=self.include_emissions_bias,
+                include_bias=self.use_emissions_bias,
             )
         if self.use_initial_prior:
             priors["init"] = WeightSpaceGaussianProcess(
@@ -583,26 +584,17 @@ class CLDS2:
     def initialize_params(self, num_samples, seed: int = 2):
         """Initialize the parameters based on the priors and flags"""
         Ab_key, Cd_key, m0_key = jxr.split(jxr.PRNGKey(seed), 3)
-        if self.use_dynamics_prior:
-            dynamics_weights = self.priors["dynamics"].sample_weights(Ab_key)
-            if self.include_dynamics_bias:
-                dynamics_bias = dynamics_weights[:, :, -1:]
-                dynamics_weights = dynamics_weights[:, :, :-1]
-            else:
-                dynamics_bias = jnp.zeros((num_samples, self.state_dim))
+
+        dynamics_weights = self.priors["dynamics"].sample_weights(Ab_key)
+        if self.use_dynamics_bias:
+            dynamics_bias = dynamics_weights[:, :, -1:]
+            dynamics_weights = dynamics_weights[:, :, :-1]
         else:
-            dynamics_weights = jxr.normal(
-                Ab_key, (num_samples, self.state_dim, self.state_dim)
-            )
-            dynamics_bias = (
-                jxr.normal(Ab_key, (num_samples, self.state_dim, self.state_dim))
-                if self.include_dynamics_bias
-                else jnp.zeros((num_samples, self.state_dim))
-            )
+            dynamics_bias = jnp.zeros((num_samples, self.state_dim))
 
         if self.use_emissions_prior:
             emissions_weights = self.priors["emissions"].sample_weights(Cd_key)
-            if self.include_emissions_bias:
+            if self.use_emissions_bias:
                 emissions_bias = emissions_weights[:, :, -1:]
                 emissions_weights = emissions_weights[:, :, :-1]
             else:
@@ -613,8 +605,8 @@ class CLDS2:
                 (num_samples, 1, 1),
             )
             emissions_bias = (
-                jxr.normal(Cd_key, (num_samples, self.emission_dim))
-                if self.include_emissions_bias
+                jnp.tile(jxr.normal(Cd_key, (self.emission_dim)), (num_samples, 1))
+                if self.use_emissions_bias
                 else jnp.zeros((num_samples, self.emission_dim))
             )
 
@@ -663,26 +655,23 @@ class CLDS2:
     def log_prior(self, params: ParamsCLDS2, inputs):
         """Compute the log prior of the parameters. Conditions are inputs"""
 
-        if self.use_dynamics_prior:
-            logprior_Ab = self.priors["dynamics"].log_prob_weights(
-                jnp.concatenate(
-                    (params.dynamics_weights, params.dynamics_bias), axis=-1
-                )
-            )
-        else:
-            logprior_Ab = 0.0
+        logprior_Ab = self.priors["dynamics"].log_prob_weights(
+            params.dynamics_weights
+        ) + (
+            self.priors["dynamics"].log_prob_weights(params.dynamics_bias)
+            if self.use_dynamics_bias
+            else 0.0
+        )
 
         if self.use_emissions_prior:
-            if self.include_emissions_bias:
-                logprior_Cd = self.priors["emissions"].log_prob_weights(
-                    jnp.concatenate(
-                        (params.emissions_weights, params.emissions_bias), axis=-1
-                    )
-                )
-            else:
-                logprior_Cd = self.priors["emissions"].log_prob_weights(
-                    params.emissions_weights
-                )
+            logprior_Cd = self.priors["emissions"].log_prob_weights(
+                params.emissions_weights
+            ) + (
+                self.priors["emissions"].log_prob_weights(params.emissions_bias)
+                if self.use_emissions_bias
+                else 0.0
+            )
+
         else:
             logprior_Cd = 0.0
 
@@ -698,29 +687,30 @@ class CLDS2:
     def weights_to_params(self, params, inputs):
         """Transform weights of weight space into parameters.
         Implement as needed for all weight-space GP priors."""
-        if self.use_dynamics_prior:
-            As = self.priors["dynamics"](params.dynamics_weights, inputs)
-            bs = (
-                self.priors["dynamics"](params.dynamics_bias, inputs)
-                if self.include_dynamics_bias
-                else jnp.zeros((inputs.shape[0], self.priors["dynamics"].output_dim))
-            )
-        else:
-            As = params.dynamics_weights
-            bs = params.dynamics_bias
-
+        As = self.priors["dynamics"](params.dynamics_weights, inputs)
+        bs = (
+            self.priors["dynamics"](params.dynamics_bias, inputs)
+            if self.use_dynamics_bias
+            else jnp.zeros((inputs.shape[0], self.state_dim))
+        )
         if self.use_emissions_prior:
             Cs = self.priors["emissions"](params.emissions_weights, inputs)
             ds = (
                 self.priors["emissions"](params.emissions_bias, inputs)
-                if self.include_emissions_bias
-                else jnp.zeros((inputs.shape[0], self.priors["emissions"].output_dim))
+                if self.use_emissions_bias
+                else jnp.zeros((inputs.shape[0], self.emission_dim))
             )
         else:
             Cs = params.emissions_weights
             if Cs.ndim == 2:
                 Cs = jnp.tile(Cs[None], (len(inputs), 1, 1))
-            ds = params.emissions_bias
+            ds = (
+                params.emissions_bias
+                if self.use_emissions_bias
+                else jnp.zeros((inputs.shape[0], self.emission_dim))
+            )
+            if ds.shape[0] != len(inputs):
+                ds = jnp.tile(ds, (len(inputs), 1, 1))
 
         m0 = (
             self.priors["init"](params.initial_mean, inputs)[0]
@@ -733,8 +723,6 @@ class CLDS2:
         """inputs as conditions"""
         # Format params
         As, Cs, bs, ds, m0 = self.weights_to_params(params, inputs)
-        if Cs.ndim == 2:
-            Cs = jnp.tile(Cs[None], (len(inputs), 1, 1))
 
         # Run the smoother
         lgssm_params = {
@@ -834,9 +822,6 @@ class CLDS2:
         # Append bias to the inputs
         # inputs = jnp.concatenate((inputs, jnp.ones((num_timesteps, 1))), axis=1)
         up = inputs[:-1]
-        # upb = jnp.concatenate((up, jnp.ones((num_timesteps - 1, 1))), axis=1)
-        upb = jnp.vstack((up, jnp.ones((num_timesteps - 1)))).T
-        # u = inputs
 
         # expected sufficient statistics for the initial distribution
         Ex0 = smoothed_means[0]
@@ -859,41 +844,46 @@ class CLDS2:
         # let zp[t] = [x[t], u[t]] for t = 0...T-2
         # let xn[t] = x[t+1]          for t = 0...T-2
         sum_xpxpT = Vxp.sum(0) + Exp.T @ Exp
-        sum_xpT = Exp.T @ upb
-        sum_xpxpT = jnp.block([[sum_xpxpT, sum_xpT], [sum_xpT.T, upb.T @ upb]])
-        sum_xpxnT = jnp.block([[Expxn.sum(0)], [upb.T @ Exn]])
-        # sum_xpxnT = Expxn.sum(0)
+        sum_xpxnT = Expxn.sum(0)
+
+        # if self.use_dynamics_bias:
+        #     bp = jnp.ones((num_timesteps - 1, 1))
+        #     sum_xpT = Exp.T @ bp
+        #     sum_xpxpT = jnp.block([[sum_xpxpT, sum_xpT], [sum_xpT.T, bp.T @ bp]])
+        #     sum_xpxnT = jnp.block([[Expxn.sum(0)], [bp.T @ Exn]])
+
         sum_xnxnT = Vxn.sum(0) + Exn.T @ Exn
         dynamics_stats = (sum_xpxpT, sum_xpxnT, sum_xnxnT, num_timesteps - 1)
 
         # full E-step sufficient stats
-        if self.use_dynamics_prior:
-            ExpxpT = jnp.einsum("ti,tj->tij", Exp, Exp) + Vxp
-            _Phi = self.priors["dynamics"].evaluate_basis(up)
+        # if self.use_dynamics_prior:
+        ExpxpT = jnp.einsum("ti,tj->tij", Exp, Exp) + Vxp
+        _Phi = self.priors["dynamics"].evaluate_basis(up)
 
-            # (LD2 x LD2), (LD2 x D1)
-            sum_zpzpT, sum_zpxnT = weightspace_stats2(_Phi, XTX=ExpxpT, XTY=Expxn)
-            if self.include_dynamics_bias:
-                # (L x LD2), (L x D1)
-                sum_zpT, sum_znT = weightspace_stats2(
-                    _Phi, XTX=Exp[:, None, :], XTY=Exn[:, None, :]
-                )
-                # ((LD2+L) x (LD2+L)))
-                sum_zpzpT = jnp.block(
-                    [
-                        [sum_zpzpT, sum_zpT.T],
-                        [sum_zpT, jnp.einsum("tk,tl->kl", _Phi, _Phi)],
-                    ]
-                )
-                # ((LD2+L) x D1)
-                sum_zpxnT = jnp.concatenate([sum_zpxnT, sum_znT], axis=0)
-            dynamics_sylvester_stats = (
-                sum_zpzpT,
-                params.dynamics_cov,
-                sum_zpxnT,
-                sum_xnxnT,
-                num_timesteps - 1,
+        # (LD2 x LD2), (LD2 x D1)
+        sum_zpzpT, sum_zpxnT = weightspace_stats2(_Phi, XTX=ExpxpT, XTY=Expxn)
+        if self.use_dynamics_bias:
+            # (L x LD2), (L x D1)
+            sum_zpT, sum_znT = weightspace_stats2(
+                _Phi, XTX=Exp[:, None, :], XTY=Exn[:, None, :]
             )
+            # ((LD2+L) x (LD2+L)))
+            sum_zpzpT = jnp.block(
+                [
+                    [sum_zpzpT, sum_zpT.T],
+                    [sum_zpT, jnp.einsum("tk,tl->kl", _Phi, _Phi)],
+                ]
+            )
+            # ((LD2+L) x D1)
+            sum_zpxnT = jnp.concatenate([sum_zpxnT, sum_znT], axis=0)
+
+        dynamics_sylvester_stats = (
+            sum_zpzpT,
+            params.dynamics_cov,
+            sum_zpxnT,
+            sum_xnxnT,
+            num_timesteps - 1,
+        )
 
         # more expected sufficient statistics for the emissions
         y = emissions
@@ -901,11 +891,11 @@ class CLDS2:
         sum_xyT = Ex.T @ y
         sum_yyT = emissions.T @ emissions
 
-        if self.include_emissions_bias:
-            ub = jnp.vstack((inputs, jnp.ones((num_timesteps)))).T
-            sum_xT = Ex.T @ ub
-            sum_xxT = jnp.block([[sum_xxT, sum_xT], [sum_xT.T, ub.T @ ub]])
-            sum_xyT = jnp.block([[sum_xyT], [ub.T @ y]])
+        if self.use_emissions_bias:
+            b = jnp.ones((num_timesteps, 1))
+            sum_xT = Ex.T @ b
+            sum_xxT = jnp.block([[sum_xxT, sum_xT], [sum_xT.T, b.T @ b]])
+            sum_xyT = jnp.block([[sum_xyT], [b.T @ y]])
 
         emission_stats = (sum_xxT, sum_xyT, sum_yyT, num_timesteps)
 
@@ -915,7 +905,7 @@ class CLDS2:
             ExyT = jnp.einsum("ti,tj->tij", Ex, y)
             sum_zzT, sum_zyT = weightspace_stats2(_Phi, ExxT, ExyT)
 
-            if self.include_emissions_bias:
+            if self.use_emissions_bias:
                 sum_zT, sum_yT = weightspace_stats2(
                     _Phi, XTX=Ex[:, None, :], XTY=y[:, None, :]
                 )
@@ -952,11 +942,16 @@ class CLDS2:
         params: ParamsCLDS,
         batch_stats: Tuple,  # inputs: Optional[Float[Array, "num_timesteps input_dim"]]=None,
     ) -> ParamsCLDS:
-        def fit_linear_regression(ExxT, ExyT, EyyT, N):
+        def fit_linear_regression(ExxT, ExyT, EyyT, N, use_bias):
             # Solve a linear regression given sufficient statistics
             W = utils.psd_solve(ExxT, ExyT).T
             Sigma = (EyyT - W @ ExyT - ExyT.T @ W.T + W @ ExxT @ W.T) / N
-            return W, Sigma
+            if use_bias:
+                bias = W[:, -1:]
+                W = W[:, :-1]
+            else:
+                bias = None
+            return W, bias, Sigma
 
         def fit_gplinear_regression(ZTZ, ZTY, wgp_prior):
             # Solve a linear regression in weight-space given sufficient statistics
@@ -1029,13 +1024,13 @@ class CLDS2:
             m = sum_x0 / N
 
         # Dynamics M-step
-        F_static, Q = fit_linear_regression(*dynamics_stats)
+        F_static, _, Q = fit_linear_regression(*dynamics_stats, self.use_dynamics_bias)
 
         # flip input and output dimensions
-        As, bs, Q = fit_gplinear_regression_sylvester2(
+        As, bs, _ = fit_gplinear_regression_sylvester2(
             *Ab_sylvester_stats,
             self.priors["dynamics"],
-            self.include_dynamics_bias,
+            self.use_dynamics_bias,
         )
 
         # # Use the following for homogeneous bias
@@ -1043,23 +1038,15 @@ class CLDS2:
         # bs = jnp.tile(b, (len(up), 1))
 
         # Emission M-step
-        H_static, R = fit_linear_regression(*emission_stats)
         if self.use_emissions_prior:
             # In weight space
-            # W_C = fit_gplinear_regression(*wgpC_stats, self.wgps['C'])
-            Cs, ds, _ = fit_gplinear_regression_sylvester2(
+            Cs, ds, R = fit_gplinear_regression_sylvester2(
                 *Cd_sylvester_stats,
                 self.priors["emissions"],
-                self.include_emissions_bias,
+                self.use_emissions_bias,
             )
-            # fit_gplinear_regression_sylvester(
-            #     wgpC_sylvester_stats[0],
-            #     wgpC_sylvester_stats[1] / wgpC_sylvester_stats[3],
-            #     wgpC_sylvester_stats[2],
-            #     wgp_prior=self.priors["emissions"],
-            # )
         else:
-            Cs = H_static
+            Cs, ds, R = fit_linear_regression(*emission_stats, self.use_emissions_bias)
 
         # logger.warning('Warning, fixing Q and R')
         # Q = jnp.eye(self.state_dim) # Can fix Q to be identity (for identifiability)
@@ -1071,7 +1058,7 @@ class CLDS2:
             dynamics_bias=bs,
             dynamics_cov=Q,
             emissions_weights=Cs,
-            emissions_bias=params.emissions_bias,
+            emissions_bias=ds,
             emissions_cov=R,
         )
         return params
