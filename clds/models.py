@@ -137,6 +137,104 @@ class WeightSpaceGaussianProcess:
         ).prod() * jnp.log(2 * jnp.pi)
 
 
+class WeightSpaceGaussianProcess2:
+    """
+    Weight-space Gaussian Process prior for matrix-valued random functions
+        A_ij(u) = \sum_l w^{(ij)} \phi_l(u),       w^{(ij)} ~ N(0, 1)
+    where w are the weights and \phi_l are the basis functions.
+
+    Constants:
+        L: number of basis functions
+        D1: output dimension
+        D2: input dimension
+        M: dimension of u, the "conditions"
+    """
+
+    def __init__(
+        self,
+        basis: list,
+        input_dim: int = 1,
+        output_dim: int = 1,
+        include_bias: bool = False,
+    ):
+        self.basis = basis
+        self.n_basis_funcs = len(basis.coef)
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.include_bias = include_bias
+
+    def __call__(
+        self,
+        weights: Float[Array, "n_basis_funcs output_dim input_dim"],
+        conditions: Float[Array, "n_steps n_conditions"],
+    ) -> Float[Array, "n_steps output_dim input_dim"]:
+        """
+        Evaluate A_ij(u) = \sum_l w^{(ij)} \phi_l(u) at the M-dimensional points u in `conditions`
+        with `weights` w^{(ij)} and basis functions \phi_l.
+        """
+        PhiX = self.evaluate_basis(conditions)
+        return jnp.einsum("lij,tl->tij", weights, PhiX)
+
+    def sample_weights(
+        self, key: jxr.PRNGKey
+    ) -> Float[Array, "n_basis_funcs output_dim input_dim"]:
+        return jxr.normal(
+            key,
+            shape=(
+                self.n_basis_funcs,
+                self.output_dim,
+                self.input_dim + self.include_bias,
+            ),
+        )
+
+    def evaluate_basis(
+        self, u: Float[Array, "n_steps n_conditions"]
+    ) -> Float[Array, "n_steps n_basis_funcs"]:
+        return self.basis.evaluate(u)
+
+    def sample(
+        self, key: jxr.PRNGKey, conditions: Float[Array, "n_steps n_conditions"]
+    ) -> Float[Array, "n_steps output_dim input_dim"]:
+        """
+        Sample from the GP prior at the points `conditions`
+        """
+        weights = self.sample_weights(key)
+        return self.__call__(weights, conditions)
+
+    # def log_prob(
+    #     self,
+    #     conditions: Float[Array, "n_steps n_conditions"],
+    #     fs: Float[Array, "n_steps input_dim output_dim"],
+    # ) -> Float[Array, "input_dim output_dim"]:
+    #     """
+    #     Compute the log probability of the GP draws at the points `conditions`
+    #     """
+    #     # Check dimensions
+    #     if fs.ndim == 2:
+    #         assert (self.output_dim == 1) ^ (self.input_dim == 1), "Incorrect dimensions"
+    #         fs = fs.reshape(-1, self.output_dim, self.input_dim)
+    #     assert fs.shape[1] == self.output_dim and fs.shape[2] == self.input_dim, "Incorrect dimensions"
+
+    #     # Compute log prob
+    #     T = len(fs)
+    #     Phi = self.evaluate_basis(conditions)  # T x L
+    #     cov = jnp.dot(Phi, Phi.T)  # T x T
+    #     # return jax.vmap(lambda _f: logprob_analytic(_f, jnp.zeros(T), cov), in_axes=(1))(fs.reshape(T, -1)).reshape(self.output_dim, self.input_dim)
+
+    #     model_dist = dist.MultivariateNormal(jnp.zeros(T), covariance_matrix=cov)
+    #     return model_dist.log_prob(fs.reshape(T, -1).T).reshape(self.output_dim, self.input_dim)
+
+    def log_prob_weights(
+        self, weights: Float[Array, "n_basis_funcs output_dim input_dim"]
+    ) -> float:
+        """
+        Standard Gaussian prior N(0,1) on the weights
+        """
+        return -0.5 * jnp.sum(weights**2) - 0.5 * jnp.asarray(
+            weights.shape
+        ).prod() * jnp.log(2 * jnp.pi)
+
+
 # %%
 class CLDS:
     """
@@ -530,7 +628,7 @@ class CLDS2:
         state_dim: int,
         emission_dim: int,
         basis_funcs: list,
-        # use_dynamics_prior: bool = True,
+        use_dynamics_prior: bool = True,
         use_emissions_prior: bool = True,
         use_initial_prior: bool = True,
         use_dynamics_bias: bool = True,
@@ -541,7 +639,7 @@ class CLDS2:
         self.state_dim = state_dim
         self.emission_dim = emission_dim
 
-        # self.use_dynamics_prior = use_dynamics_prior
+        self.use_dynamics_prior = use_dynamics_prior
         self.use_dynamics_bias = use_dynamics_bias
         self.use_emissions_prior = use_emissions_prior
         self.use_emissions_bias = use_emissions_bias
@@ -560,13 +658,13 @@ class CLDS2:
             "emissions": None,
             "init": None,
         }
-        # always use dynamics prior
-        priors["dynamics"] = WeightSpaceGaussianProcess(
-            basis_funcs=basis_funcs,
-            input_dim=self.state_dim,
-            output_dim=self.state_dim,
-            include_bias=self.use_dynamics_bias,
-        )
+        if self.use_dynamics_prior:
+            priors["dynamics"] = WeightSpaceGaussianProcess(
+                basis_funcs=basis_funcs,
+                input_dim=self.state_dim,
+                output_dim=self.state_dim,
+                include_bias=self.use_dynamics_bias,
+            )
         if self.use_emissions_prior:
             priors["emissions"] = WeightSpaceGaussianProcess(
                 basis_funcs=basis_funcs,
@@ -587,13 +685,27 @@ class CLDS2:
         """Initialize the parameters based on the priors and flags"""
         Ab_key, Cd_key, m0_key = jxr.split(jxr.PRNGKey(seed), 3)
 
-        dynamics_weights = self.priors["dynamics"].sample_weights(Ab_key)
-        if self.use_dynamics_bias:
-            dynamics_bias = dynamics_weights[:, :, -1:]
-            dynamics_weights = dynamics_weights[:, :, :-1]
-        else:
-            dynamics_bias = jnp.zeros((num_samples, self.state_dim))
+        # initialize dynamics
+        if self.use_dynamics_prior:
+            dynamics_weights = self.priors["dynamics"].sample_weights(Ab_key)
+            if self.use_dynamics_bias:
+                dynamics_bias = dynamics_weights[:, :, -1:]
+                dynamics_weights = dynamics_weights[:, :, :-1]
+            else:
+                dynamics_bias = jnp.zeros((num_samples, self.state_dim))
 
+        else:
+            dynamics_weights = jnp.tile(
+                jxr.normal(Ab_key, (self.state_dim, self.state_dim)),
+                (num_samples, 1, 1),
+            )
+            dynamics_bias = (
+                jnp.tile(jxr.normal(Ab_key, (self.state_dim)), (num_samples, 1))
+                if self.use_dynamics_bias
+                else jnp.zeros((num_samples, self.state_dim))
+            )
+
+        # initialize emissions
         if self.use_emissions_prior:
             emissions_weights = self.priors["emissions"].sample_weights(Cd_key)
             if self.use_emissions_bias:
@@ -612,11 +724,13 @@ class CLDS2:
                 else jnp.zeros((num_samples, self.emission_dim))
             )
 
+        # initialize initial state
         if self.use_initial_prior:
             initial_mean = self.priors["init"].sample_weights(m0_key)
         else:
             initial_mean = jxr.normal(m0_key, (num_samples, self.state_dim))
 
+        # pack together
         return ParamsCLDS2(
             dynamics_weights=dynamics_weights,
             dynamics_bias=dynamics_bias,
@@ -628,7 +742,7 @@ class CLDS2:
             emissions_cov=jnp.eye(self.emission_dim),
         )
 
-    def sample_dynamics(
+    def run_dynamics(
         self, inputs: Float[Array, "num_timesteps input_dim"], seed: int = 2
     ):
         As, Cs, bs, ds, m0 = self.weights_to_params(self.params, inputs)
@@ -684,17 +798,28 @@ class CLDS2:
 
         return logprior_Ab + logprior_Cd + logprior_m0
 
-    # def A(self, inputs):
-
     def weights_to_params(self, params, inputs):
         """Transform weights of weight space into parameters.
         Implement as needed for all weight-space GP priors."""
-        As = self.priors["dynamics"](params.dynamics_weights, inputs)
-        bs = (
-            self.priors["dynamics"](params.dynamics_bias, inputs)
-            if self.use_dynamics_bias
-            else jnp.zeros((inputs.shape[0], self.state_dim))
-        )
+        if self.use_dynamics_prior:
+            As = self.priors["dynamics"](params.dynamics_weights, inputs)
+            bs = (
+                self.priors["dynamics"](params.dynamics_bias, inputs)
+                if self.use_dynamics_bias
+                else jnp.zeros((inputs.shape[0], self.state_dim))
+            )
+        else:
+            As = params.dynamics_weights
+            if As.ndim == 2:
+                As = jnp.tile(As[None], (len(inputs), 1, 1))
+            bs = (
+                params.dynamics_bias
+                if self.use_dynamics_bias
+                else jnp.zeros((inputs.shape[0], self.state_dim))
+            )
+            if bs.shape[0] != len(inputs):
+                bs = jnp.tile(bs, (len(inputs), 1, 1))
+
         if self.use_emissions_prior:
             Cs = self.priors["emissions"](params.emissions_weights, inputs)
             ds = (
@@ -756,7 +881,7 @@ class CLDS2:
         inputs: Optional[Float[Array, "num_timesteps input_dim"]] = None,
     ):
 
-        def weightspace_stats2(
+        def weightspace_stats(
             Phi: Float[Array, "n_steps n_basis_funcs"],
             XTX: Float[Array, "n_steps input_dim input_dim"] = None,
             XTY: Float[Array, "n_steps input_dim output_dim"] = None,
@@ -822,13 +947,13 @@ class CLDS2:
             _cond = (
                 up[0].reshape(1) if up[0].ndim == 0 else up[0].reshape(1, up.shape[1])
             )
-            wgpm0_stats = weightspace_stats2(
+            init_gp_stats = weightspace_stats(
                 self.priors["init"].evaluate_basis(_cond),
                 XTX_m0,
                 m0_targets,
             )
         else:
-            wgpm0_stats = None
+            init_gp_stats = None
 
         # expected sufficient statistics for the dynamics
         # let zp[t] = [x[t], u[t]] for t = 0...T-2
@@ -846,34 +971,36 @@ class CLDS2:
         dynamics_stats = (sum_xpxpT, sum_xpxnT, sum_xnxnT, num_timesteps - 1)
 
         # full E-step sufficient stats
-        # if self.use_dynamics_prior:
-        ExpxpT = jnp.einsum("ti,tj->tij", Exp, Exp) + Vxp
-        _Phi = self.priors["dynamics"].evaluate_basis(up)
+        if self.use_dynamics_prior:
+            ExpxpT = jnp.einsum("ti,tj->tij", Exp, Exp) + Vxp
+            _Phi = self.priors["dynamics"].evaluate_basis(up)
 
-        # (LD2 x LD2), (LD2 x D1)
-        sum_zpzpT, sum_zpxnT = weightspace_stats2(_Phi, XTX=ExpxpT, XTY=Expxn)
-        if self.use_dynamics_bias:
-            # (L x LD2), (L x D1)
-            sum_zpT, sum_znT = weightspace_stats2(
-                _Phi, XTX=Exp[:, None, :], XTY=Exn[:, None, :]
-            )
-            # ((LD2+L) x (LD2+L)))
-            sum_zpzpT = jnp.block(
-                [
-                    [sum_zpzpT, sum_zpT.T],
-                    [sum_zpT, jnp.einsum("tk,tl->kl", _Phi, _Phi)],
-                ]
-            )
-            # ((LD2+L) x D1)
-            sum_zpxnT = jnp.concatenate([sum_zpxnT, sum_znT], axis=0)
+            # (LD2 x LD2), (LD2 x D1)
+            sum_zpzpT, sum_zpxnT = weightspace_stats(_Phi, XTX=ExpxpT, XTY=Expxn)
+            if self.use_dynamics_bias:
+                # (L x LD2), (L x D1)
+                sum_zpT, sum_znT = weightspace_stats(
+                    _Phi, XTX=Exp[:, None, :], XTY=Exn[:, None, :]
+                )
+                # ((LD2+L) x (LD2+L)))
+                sum_zpzpT = jnp.block(
+                    [
+                        [sum_zpzpT, sum_zpT.T],
+                        [sum_zpT, jnp.einsum("tk,tl->kl", _Phi, _Phi)],
+                    ]
+                )
+                # ((LD2+L) x D1)
+                sum_zpxnT = jnp.concatenate([sum_zpxnT, sum_znT], axis=0)
 
-        dynamics_sylvester_stats = (
-            sum_zpzpT,
-            params.dynamics_cov,
-            sum_zpxnT,
-            sum_xnxnT,
-            num_timesteps - 1,
-        )
+            dynamics_gp_stats = (
+                sum_zpzpT,
+                params.dynamics_cov,
+                sum_zpxnT,
+                sum_xnxnT,
+                num_timesteps - 1,
+            )
+        else:
+            dynamics_gp_stats = None
 
         # more expected sufficient statistics for the emissions
         y = emissions
@@ -893,10 +1020,10 @@ class CLDS2:
             _Phi = self.priors["emissions"].evaluate_basis(inputs)
             ExxT = jnp.einsum("ti,tj->tij", Ex, Ex) + Vx
             ExyT = jnp.einsum("ti,tj->tij", Ex, y)
-            sum_zzT, sum_zyT = weightspace_stats2(_Phi, ExxT, ExyT)
+            sum_zzT, sum_zyT = weightspace_stats(_Phi, ExxT, ExyT)
 
             if self.use_emissions_bias:
-                sum_zT, sum_yT = weightspace_stats2(
+                sum_zT, sum_yT = weightspace_stats(
                     _Phi, XTX=Ex[:, None, :], XTY=y[:, None, :]
                 )
                 sum_zzT = jnp.block(
@@ -907,7 +1034,7 @@ class CLDS2:
                 )
                 sum_zyT = jnp.concatenate([sum_zyT, sum_yT], axis=0)
 
-            emissions_sylvester_stats = (
+            emissions_gp_stats = (
                 sum_zzT,
                 params.emissions_cov,
                 sum_zyT,
@@ -916,15 +1043,15 @@ class CLDS2:
             )
 
         else:
-            emissions_sylvester_stats = None
+            emissions_gp_stats = None
 
         return (
             init_stats,
-            wgpm0_stats,
+            init_gp_stats,
             dynamics_stats,
             emission_stats,
-            emissions_sylvester_stats,
-            dynamics_sylvester_stats,
+            emissions_gp_stats,
+            dynamics_gp_stats,
         ), marginal_loglik
 
     def m_step(
@@ -998,7 +1125,7 @@ class CLDS2:
         stats = jax.tree_util.tree_map(partial(jnp.sum, axis=0), batch_stats)
         (
             init_stats,
-            wgpm0_stats,
+            init_gp_stats,
             dynamics_stats,
             emission_stats,
             Cd_sylvester_stats,
@@ -1009,7 +1136,7 @@ class CLDS2:
         sum_x0, sum_x0x0T, N = init_stats
         S = sum_x0x0T / N - jnp.outer(sum_x0, sum_x0) / (N**2)
         if self.use_initial_prior:
-            m = fit_gplinear_regression(*wgpm0_stats, self.priors["init"])
+            m = fit_gplinear_regression(*init_gp_stats, self.priors["init"])
         else:
             m = sum_x0 / N
 

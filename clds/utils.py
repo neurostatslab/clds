@@ -5,6 +5,7 @@
 """
 
 import jax.numpy as jnp
+import nemos as nmo
 import jax
 import numpy as np
 from functools import reduce
@@ -294,6 +295,36 @@ def T1_basis(
 #             basis_funcs.append(_f_sin)
 #             basis_funcs.append(_f_cos)
 #     return basis_funcs
+
+
+class TorusBasis:
+    def __init__(
+        self,
+        frequencies: int,
+        ndim: int,
+        bounds: tuple = None,
+        sigma: float = 1.0,
+        kappa: float = 1.0,
+    ):
+        self.basis = nmo.basis.FourierEval(
+            frequencies=frequencies, ndim=ndim, bounds=bounds, frequency_mask="all"
+        )
+        self.sigma = sigma
+        self.kappa = kappa
+        coef = jnp.sqrt(
+            TorusBasis.squared_exponential_spectral_measure(
+                jnp.linalg.norm(self.basis._freq_combinations, axis=0), sigma, kappa
+            )
+        )
+        self.coef = jnp.hstack((coef, coef[1:]))
+
+    @staticmethod
+    def squared_exponential_spectral_measure(m, sigma, kappa):
+        C_inf = float(mpmath.jtheta(3, 0.0, mpmath.exp(-2 * mpmath.pi**2 * kappa**2)))
+        return (sigma**2 / C_inf) * jnp.exp(-2 * jnp.pi**2 * kappa**2 * m**2)
+
+    def evaluate(self, u):
+        return self.basis.evaluate(u) * self.coef
 
 
 def Tm_basis(
