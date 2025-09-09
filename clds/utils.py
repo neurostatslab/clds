@@ -5,6 +5,7 @@
 """
 
 import jax.numpy as jnp
+
 import nemos as nmo
 import jax
 import numpy as np

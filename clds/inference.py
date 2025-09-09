@@ -69,6 +69,7 @@ def fit_em(
 
         params = model.initial_params
     else:
+        model.initial_params = initial_params
         params = initial_params
 
     @jit
@@ -94,11 +95,11 @@ def fit_em(
         log_probs.append(log_prob)
         marginal_log_liks.append(marginal_log_lik)
 
-        # if i > 2 and marginal_log_lik < marginal_log_liks[-2]:
-        #     pbar.set_description(
-        #         f"EM stopped at iteration {i+1} due to decreasing marginal_log_lik"
-        #     )
-        #     break
+        if i > 2 and marginal_log_lik < marginal_log_liks[-2]:
+            pbar.set_description(
+                f"EM stopped at iteration {i+1} due to decreasing marginal_log_lik"
+            )
+            break
 
         if jnp.isnan(log_prob):
             pbar.set_description(f"EM stopped at iteration {i+1} due to NaN values")

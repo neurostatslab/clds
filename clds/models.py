@@ -54,13 +54,13 @@ class WeightSpaceGaussianProcess:
 
     def __init__(
         self,
-        basis_funcs: list,
+        basis: list,
         input_dim: int = 1,
         output_dim: int = 1,
         include_bias: bool = False,
     ):
-        self.basis_funcs = basis_funcs
-        self.n_basis_funcs = len(basis_funcs)
+        self.basis = basis
+        self.n_basis_funcs = len(basis)
         self.input_dim = input_dim
         self.output_dim = output_dim
         self.include_bias = include_bias
@@ -92,7 +92,7 @@ class WeightSpaceGaussianProcess:
     def evaluate_basis(
         self, u: Float[Array, "n_steps n_conditions"]
     ) -> Float[Array, "n_steps n_basis_funcs"]:
-        return jnp.array([jax.vmap(f)(u) for f in self.basis_funcs]).T
+        return jnp.array([jax.vmap(f)(u) for f in self.basis]).T
 
     def sample(
         self, key: jxr.PRNGKey, conditions: Float[Array, "n_steps n_conditions"]
@@ -200,29 +200,6 @@ class WeightSpaceGaussianProcess2:
         """
         weights = self.sample_weights(key)
         return self.__call__(weights, conditions)
-
-    # def log_prob(
-    #     self,
-    #     conditions: Float[Array, "n_steps n_conditions"],
-    #     fs: Float[Array, "n_steps input_dim output_dim"],
-    # ) -> Float[Array, "input_dim output_dim"]:
-    #     """
-    #     Compute the log probability of the GP draws at the points `conditions`
-    #     """
-    #     # Check dimensions
-    #     if fs.ndim == 2:
-    #         assert (self.output_dim == 1) ^ (self.input_dim == 1), "Incorrect dimensions"
-    #         fs = fs.reshape(-1, self.output_dim, self.input_dim)
-    #     assert fs.shape[1] == self.output_dim and fs.shape[2] == self.input_dim, "Incorrect dimensions"
-
-    #     # Compute log prob
-    #     T = len(fs)
-    #     Phi = self.evaluate_basis(conditions)  # T x L
-    #     cov = jnp.dot(Phi, Phi.T)  # T x T
-    #     # return jax.vmap(lambda _f: logprob_analytic(_f, jnp.zeros(T), cov), in_axes=(1))(fs.reshape(T, -1)).reshape(self.output_dim, self.input_dim)
-
-    #     model_dist = dist.MultivariateNormal(jnp.zeros(T), covariance_matrix=cov)
-    #     return model_dist.log_prob(fs.reshape(T, -1).T).reshape(self.output_dim, self.input_dim)
 
     def log_prob_weights(
         self, weights: Float[Array, "n_basis_funcs output_dim input_dim"]
@@ -627,7 +604,7 @@ class CLDS2:
         self,
         state_dim: int,
         emission_dim: int,
-        basis_funcs: list,
+        basis: list,
         use_dynamics_prior: bool = True,
         use_emissions_prior: bool = True,
         use_initial_prior: bool = True,
@@ -649,9 +626,9 @@ class CLDS2:
         self.params = None
 
         # initialize priors
-        self.priors = self.initialize_priors(basis_funcs)
+        self.priors = self.initialize_priors(basis)
 
-    def initialize_priors(self, basis_funcs: list):
+    def initialize_priors(self, basis: list):
         """Initialize the priors based on the flags"""
         priors = {
             "dynamics": None,
@@ -660,21 +637,21 @@ class CLDS2:
         }
         if self.use_dynamics_prior:
             priors["dynamics"] = WeightSpaceGaussianProcess(
-                basis_funcs=basis_funcs,
+                basis=basis,
                 input_dim=self.state_dim,
                 output_dim=self.state_dim,
                 include_bias=self.use_dynamics_bias,
             )
         if self.use_emissions_prior:
             priors["emissions"] = WeightSpaceGaussianProcess(
-                basis_funcs=basis_funcs,
+                basis=basis,
                 input_dim=self.state_dim,
                 output_dim=self.emission_dim,
                 include_bias=self.use_emissions_bias,
             )
         if self.use_initial_prior:
             priors["init"] = WeightSpaceGaussianProcess(
-                basis_funcs=basis_funcs,
+                basis=basis,
                 input_dim=1,
                 output_dim=self.state_dim,
                 include_bias=False,
@@ -745,24 +722,43 @@ class CLDS2:
     def run_dynamics(
         self, inputs: Float[Array, "num_timesteps input_dim"], seed: int = 2
     ):
-        As, Cs, bs, ds, m0 = self.weights_to_params(self.params, inputs)
         key = jxr.PRNGKey(seed)
+        As, Cs, bs, ds, m0 = self.weights_to_params(self.params, inputs)
+        CLDS2.run_dynamics(
+            key,
+            As,
+            bs,
+            self.params.dynamics_cov,
+            Cs,
+            ds,
+            self.params.emissions_cov,
+            m0,
+            self.params.initial_cov,
+        )
 
+    @staticmethod
+    def run_dynamics(
+        key,
+        As,
+        bs,
+        Q,
+        Cs,
+        ds,
+        R,
+        m0,
+        S0,
+    ):
         def f(x, args):
             A, b, C, d, (em_key, dy_key) = args
 
-            emissions_noise = jxr.multivariate_normal(
-                em_key, jnp.zeros(self.emission_dim), self.params.emissions_cov
-            )
+            emissions_noise = jxr.multivariate_normal(em_key, jnp.zeros(R.shape[0]), R)
             y = C @ x + d + emissions_noise
 
-            dynamics_noise = jxr.multivariate_normal(
-                dy_key, jnp.zeros(self.state_dim), self.params.dynamics_cov
-            )
+            dynamics_noise = jxr.multivariate_normal(dy_key, jnp.zeros(Q.shape[0]), Q)
             x_next = A @ x + b + dynamics_noise
             return x_next, (x_next, y)
 
-        x_init = jxr.multivariate_normal(key, m0, self.params.initial_cov)
+        x_init = jxr.multivariate_normal(key, m0, S0)
         subkeys = jxr.split(key, num=(As.shape[0], 2))
         _, (x_nexts, ys) = jax.lax.scan(f, x_init, xs=(As, bs, Cs, ds, subkeys))
         xs = jnp.concatenate((x_init[None, :], x_nexts[:-1]), axis=0)
