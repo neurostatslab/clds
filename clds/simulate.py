@@ -16,7 +16,7 @@ def simulate_hd_dynamics(theta, epsilon=0.1, noise_scale=0.2):
     # dynamics
     u = jnp.array([jnp.cos(theta), jnp.sin(theta)])
     v = jnp.array([-jnp.sin(theta), jnp.cos(theta)])
-    A = ((1 - epsilon) * v[:, None] * v[None, :]).T
+    A = ((1 - epsilon) * v[:, None] * v[None, :]).transpose(-1, 0, 1)
     b = u.T  # + omega * v
 
     Q = noise_scale**2 * jnp.eye(2)
@@ -29,19 +29,16 @@ def simulate_hd_data(
     n_neurons=10,
     epsilon=0.1,
     noise_scale=0.2,
-    seed=2,
+    seed=1,
 ):
-    key = jxr.PRNGKey(1)
-    subkeys = jxr.split(key, n_batches)
-
     def form_batch(i):
-        _, subkey = jxr.split(key)
-        theta = jnp.cumsum(0.4 * jxr.normal(subkey, shape=(n_steps,))) % (2 * jnp.pi)
+        key = jxr.PRNGKey(seed + i)
+        theta = jnp.cumsum(0.4 * jxr.normal(key, shape=(n_steps,))) % (2 * jnp.pi)
         true_As, true_bs, true_Q, true_m0, true_S0 = simulate_hd_dynamics(
             theta, epsilon, noise_scale
         )
         x, y = CLDS2.run_dynamics(
-            jxr.PRNGKey(i),
+            key,
             true_As,
             true_bs,
             true_Q,
@@ -54,7 +51,7 @@ def simulate_hd_data(
         return theta, x, y
 
     # neuron tuning parameters
-    true_C = jxr.normal(key, (n_neurons, 2))  # Overwrites neuron tuning
+    true_C = jxr.normal(jxr.PRNGKey(0), (n_neurons, 2))
     true_Cs = jnp.tile(true_C, (n_steps, 1, 1))
     true_ds = jnp.zeros((n_steps, n_neurons))
     true_R = noise_scale**2 * jnp.eye(n_neurons)
@@ -64,4 +61,4 @@ def simulate_hd_data(
     X = jnp.stack(X, axis=0)
     Y = jnp.stack(Y, axis=0)
 
-    return thetas, X, Y
+    return thetas, X, Y, true_Cs

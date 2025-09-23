@@ -325,7 +325,7 @@ class TorusBasis:
         return (sigma**2 / C_inf) * jnp.exp(-2 * jnp.pi**2 * kappa**2 * m**2)
 
     def evaluate(self, u):
-        return self.basis.evaluate(u) * self.coef
+        return self.basis.evaluate(*u.T) * self.coef
 
 
 def Tm_basis(

@@ -14,6 +14,7 @@ from typing import Optional, Tuple, Dict
 from .utils import logprob_analytic
 from functools import partial
 from jax import jit, lax, vmap
+from tqdm.auto import trange
 
 from dynamax.linear_gaussian_ssm.inference import make_lgssm_params, lgssm_smoother
 
@@ -662,44 +663,45 @@ class CLDS2:
         """Initialize the parameters based on the priors and flags"""
         Ab_key, Cd_key, m0_key = jxr.split(jxr.PRNGKey(seed), 3)
 
-        # initialize dynamics
-        if self.use_dynamics_prior:
-            dynamics_weights = self.priors["dynamics"].sample_weights(Ab_key)
-            if self.use_dynamics_bias:
-                dynamics_bias = dynamics_weights[:, :, -1:]
-                dynamics_weights = dynamics_weights[:, :, :-1]
+        def get_params(key, use_prior, prior, input_dim, output_dim, use_bias):
+            if use_prior:
+                weights = prior.sample_weights(key)
+                if use_bias:
+                    bias = weights[:, :, -1:]
+                    weights = weights[:, :, :-1]
+                else:
+                    bias = jnp.zeros((num_samples, output_dim))
             else:
-                dynamics_bias = jnp.zeros((num_samples, self.state_dim))
+                weights = jnp.tile(
+                    jxr.normal(key, (output_dim, input_dim)),
+                    (num_samples, 1, 1),
+                )
+                bias = (
+                    jnp.tile(jxr.normal(key, (output_dim)), (num_samples, 1))
+                    if use_bias
+                    else jnp.zeros((num_samples, output_dim))
+                )
+            return weights, bias
 
-        else:
-            dynamics_weights = jnp.tile(
-                jxr.normal(Ab_key, (self.state_dim, self.state_dim)),
-                (num_samples, 1, 1),
-            )
-            dynamics_bias = (
-                jnp.tile(jxr.normal(Ab_key, (self.state_dim)), (num_samples, 1))
-                if self.use_dynamics_bias
-                else jnp.zeros((num_samples, self.state_dim))
-            )
+        # initialize dynamics
+        dynamics_weights, dynamics_bias = get_params(
+            Ab_key,
+            self.use_dynamics_prior,
+            self.priors["dynamics"],
+            self.state_dim,
+            self.state_dim,
+            self.use_dynamics_bias,
+        )
 
         # initialize emissions
-        if self.use_emissions_prior:
-            emissions_weights = self.priors["emissions"].sample_weights(Cd_key)
-            if self.use_emissions_bias:
-                emissions_bias = emissions_weights[:, :, -1:]
-                emissions_weights = emissions_weights[:, :, :-1]
-            else:
-                emissions_bias = jnp.zeros((num_samples, self.emission_dim))
-        else:
-            emissions_weights = jnp.tile(
-                jxr.normal(Cd_key, (self.emission_dim, self.state_dim)),
-                (num_samples, 1, 1),
-            )
-            emissions_bias = (
-                jnp.tile(jxr.normal(Cd_key, (self.emission_dim)), (num_samples, 1))
-                if self.use_emissions_bias
-                else jnp.zeros((num_samples, self.emission_dim))
-            )
+        emissions_weights, emissions_bias = get_params(
+            Cd_key,
+            self.use_emissions_prior,
+            self.priors["emissions"],
+            self.state_dim,
+            self.emission_dim,
+            self.use_emissions_bias,
+        )
 
         # initialize initial state
         if self.use_initial_prior:
@@ -719,23 +721,6 @@ class CLDS2:
             emissions_cov=jnp.eye(self.emission_dim),
         )
 
-    def run_dynamics(
-        self, inputs: Float[Array, "num_timesteps input_dim"], seed: int = 2
-    ):
-        key = jxr.PRNGKey(seed)
-        As, Cs, bs, ds, m0 = self.weights_to_params(self.params, inputs)
-        CLDS2.run_dynamics(
-            key,
-            As,
-            bs,
-            self.params.dynamics_cov,
-            Cs,
-            ds,
-            self.params.emissions_cov,
-            m0,
-            self.params.initial_cov,
-        )
-
     @staticmethod
     def run_dynamics(
         key,
@@ -749,7 +734,7 @@ class CLDS2:
         S0,
     ):
         def f(x, args):
-            A, b, C, d, (em_key, dy_key) = args
+            A, b, C, d, (dy_key, em_key) = args
 
             emissions_noise = jxr.multivariate_normal(em_key, jnp.zeros(R.shape[0]), R)
             y = C @ x + d + emissions_noise
@@ -763,6 +748,21 @@ class CLDS2:
         _, (x_nexts, ys) = jax.lax.scan(f, x_init, xs=(As, bs, Cs, ds, subkeys))
         xs = jnp.concatenate((x_init[None, :], x_nexts[:-1]), axis=0)
         return xs, ys
+
+    def predict(self, inputs: Float[Array, "num_timesteps input_dim"], seed: int = 2):
+        key = jxr.PRNGKey(seed)
+        As, Cs, bs, ds, m0 = self.weights_to_params(self.params, inputs)
+        CLDS2.run_dynamics(
+            key,
+            As,
+            bs,
+            self.params.dynamics_cov,
+            Cs,
+            ds,
+            self.params.emissions_cov,
+            m0,
+            self.params.initial_cov,
+        )
 
     def log_prior(self, params: ParamsCLDS2, inputs):
         """Compute the log prior of the parameters. Conditions are inputs"""
@@ -1191,3 +1191,71 @@ class CLDS2:
             return marginal_loglik
 
         return vmap(batch_marginal_log_lik)(emissions, conditions).sum()
+
+    def fit(
+        self,
+        emissions,
+        conditions,
+        initial_params: ParamsCLDS2 = None,
+        num_iters: int = 50,
+        seed: int = 2,
+    ):
+
+        if emissions.ndim != 3:
+            raise ValueError(
+                "emissions should be 3D, of shape (num_batches, num_timesteps, emission_dim)"
+            )
+
+        if (self.initial_params is None) and (initial_params is None):
+            # use default initialization if no initial params provided
+            initial_params = self.initialize_params(emissions.shape[1], seed)
+        elif (self.initial_params is not None) and (initial_params is None):
+            # use previously stored initial params if no initial params provided
+            initial_params = self.initial_params
+
+        # overwrite initial params
+        self.initial_params = initial_params
+
+        @jit
+        def em_step(params, emissions, conditions):
+            # Obtain current E-step stats and model log prob
+            batch_stats, lls = vmap(partial(self.e_step, params))(emissions, conditions)
+            log_priors = vmap(partial(self.log_prior, params))(conditions)
+            mll = lls.sum()
+            lp = log_priors.sum() + mll
+
+            # Update with M-step
+            params = self.m_step(params, batch_stats)
+
+            return params, (lp, mll)
+
+        log_probs, marginal_log_liks = [], []
+
+        pbar = trange(num_iters)
+        pbar.set_description("jit compiling ...")
+
+        params = initial_params
+        for i in pbar:
+            next_params, (log_prob, marginal_log_lik) = em_step(
+                params, emissions, conditions
+            )
+            log_probs.append(log_prob)
+            marginal_log_liks.append(marginal_log_lik)
+
+            if i > 2 and marginal_log_lik < marginal_log_liks[-2]:
+                pbar.set_description(
+                    f"EM stopped at iteration {i+1} due to decreasing marginal_log_lik"
+                )
+                break
+
+            if jnp.isnan(log_prob):
+                pbar.set_description(f"EM stopped at iteration {i+1} due to NaN values")
+                break
+
+            params = next_params
+            pbar.set_description(
+                f"Iter {i+1}/{num_iters}, log-prob = {log_prob:.2f}, marginal log-lik = {marginal_log_lik:.2f}"
+            )
+
+        self.params = params
+        return params, log_probs
