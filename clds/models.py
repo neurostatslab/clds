@@ -144,11 +144,16 @@ class WeightSpaceGaussianProcess2:
         A_ij(u) = \sum_l w^{(ij)} \phi_l(u),       w^{(ij)} ~ N(0, 1)
     where w are the weights and \phi_l are the basis functions.
 
-    Constants:
-        L: number of basis functions
-        D1: output dimension
-        D2: input dimension
-        M: dimension of u, the "conditions"
+    Parameters
+    ----------
+    basis : list
+        List of basis functions.
+    input_dim : int, optional
+        Dimension of the input, by default 1.
+    output_dim : int, optional
+        Dimension of the output, by default 1.
+    include_bias : bool, optional
+        Whether to include a bias term in the basis functions, by default False.
     """
 
     def __init__(
@@ -586,26 +591,35 @@ class CLDS2:
     Conditionally Linear Dynamical System (CLDS) model, with LDS dynamics and
     weight-space view parametrization of the GP priors for the parameters {A, b, C, d, m0}.
 
+    If weight-space GP priors are not specified for any parameter, it is learned as a static parameter.
+
     Parameters
     ----------
-    priors :
-        dict of WeightSpaceGaussianProcess (wGP) objects for the parameters {A, b, C, d, m0}.
     state_dim : int
         dimension of the latent state space.
     emission_dim : int
         dimension of the observation space.
-
-
-    By default: A has wGP prior, whereas b and C are optional.
-                If wGP priors are not provided for b and C, they are learned as C fixed, b time-varying.
-    This is a early version, only currently supporting EM. Does not support sampling. Does not support inputs other than GP conditions.
+    basis : list
+        list of basis functions for the weight-space GP priors.
+    use_dynamics_prior : bool, optional
+        whether to use a GP prior for the dynamics matrix A, by default True.
+    use_emissions_prior : bool, optional
+        whether to use a GP prior for the emissions matrix C, by default True.
+    use_initial_prior : bool, optional
+        whether to use a GP prior for the initial state mean m0, by default True.
+    use_dynamics_bias : bool, optional
+        whether to include a bias term in the dynamics, by default True.
+    use_emissions_bias : bool, optional
+        whether to include a bias term in the emissions, by default False.
+    initial_params : Optional[ParamsCLDS2], optional
+        initial parameters for the model, by default None.
     """
 
     def __init__(
         self,
         state_dim: int,
         emission_dim: int,
-        basis: list,
+        basis: list,  # soon to be class
         use_dynamics_prior: bool = True,
         use_emissions_prior: bool = True,
         use_initial_prior: bool = True,
@@ -659,8 +673,12 @@ class CLDS2:
             )
         return priors
 
-    def initialize_params(self, num_samples, seed: int = 2):
-        """Initialize the parameters based on the priors and flags"""
+    def initialize_params(self, num_samples: int, seed: int = 2):
+        """
+        Initialize the model parameters based on the priors and flags.
+        If priors are used, GP weights are sampled from the priors.
+        If priors are not used, static parameters are randomly initialized.
+        """
         Ab_key, Cd_key, m0_key = jxr.split(jxr.PRNGKey(seed), 3)
 
         def get_params(key, use_prior, prior, input_dim, output_dim, use_bias):
@@ -723,16 +741,51 @@ class CLDS2:
 
     @staticmethod
     def run_dynamics(
-        key,
-        As,
-        bs,
-        Q,
-        Cs,
-        ds,
-        R,
-        m0,
-        S0,
+        key: jxr.PRNGKey,
+        As: Float[Array, "num_timesteps state_dim state_dim"],
+        bs: Float[Array, "num_timesteps state_dim"],
+        Q: Float[Array, "state_dim state_dim"],
+        Cs: Float[Array, "num_timesteps emission_dim state_dim"],
+        ds: Float[Array, "num_timesteps emission_dim"],
+        R: Float[Array, "emission_dim emission_dim"],
+        m0: Float[Array, "state_dim"],
+        S0: Float[Array, "state_dim state_dim"],
     ):
+        """
+        Run CLDS dynamics to generate states and emissions, following the system:
+            x_0 ~ N(m0, S0)
+            x_t = A_t x_{t-1} + b_t + N(0, Q)
+            y_t = C_t x_t + d_t + N(0, R)
+
+        Parameters
+        ----------
+        key : jxr.PRNGKey
+            random key for sampling
+        As : Float[Array, "num_timesteps state_dim state_dim"]
+            dynamics matrices
+        bs : Float[Array, "num_timesteps state_dim"]
+            dynamics biases
+        Q : Float[Array, "state_dim state_dim"]
+            dynamics covariance
+        Cs : Float[Array, "num_timesteps emission_dim state_dim"]
+            emissions matrices
+        ds : Float[Array, "num_timesteps emission_dim"]
+            emissions biases
+        R : Float[Array, "emission_dim emission_dim"]
+            emissions covariance
+        m0 : Float[Array, "state_dim"]
+            initial state mean
+        S0 : Float[Array, "state_dim state_dim"]
+            initial state covariance
+
+        Returns
+        -------
+        xs : Float[Array, "num_timesteps state_dim"]
+            latent state dynamics
+        ys : Float[Array, "num_timesteps emission_dim"]
+            emissions
+        """
+
         def f(x, args):
             A, b, C, d, (dy_key, em_key) = args
 
@@ -750,9 +803,28 @@ class CLDS2:
         return xs, ys
 
     def predict(self, inputs: Float[Array, "num_timesteps input_dim"], seed: int = 2):
+        """
+        Predict the states and emissions given the inputs as conditions and the fitted model parameters.
+
+        Parameters
+        ----------
+        inputs : Float[Array, "num_timesteps input_dim"]
+            input conditions for the GP priors
+        seed : int, optional
+            random seed for sampling, by default 2
+
+        Returns
+        -------
+        xs : Float[Array, "num_timesteps state_dim"]
+            predicted latent states
+        ys : Float[Array, "num_timesteps emission_dim"]
+            predicted emissions
+        """
+        if self.params is None:
+            raise ValueError("Model parameters have not been fit. Call fit() first.")
         key = jxr.PRNGKey(seed)
         As, Cs, bs, ds, m0 = self.weights_to_params(self.params, inputs)
-        CLDS2.run_dynamics(
+        return CLDS2.run_dynamics(
             key,
             As,
             bs,
@@ -765,7 +837,7 @@ class CLDS2:
         )
 
     def log_prior(self, params: ParamsCLDS2, inputs):
-        """Compute the log prior of the parameters. Conditions are inputs"""
+        """Compute the log prior of the parameters."""
 
         logprior_Ab = self.priors["dynamics"].log_prob_weights(
             params.dynamics_weights
@@ -876,7 +948,6 @@ class CLDS2:
         emissions: Float[Array, "num_timesteps emission_dim"],
         inputs: Optional[Float[Array, "num_timesteps input_dim"]] = None,
     ):
-
         def weightspace_stats(
             Phi: Float[Array, "n_steps n_basis_funcs"],
             XTX: Float[Array, "n_steps input_dim input_dim"] = None,
@@ -927,15 +998,14 @@ class CLDS2:
         Vxp = smoothed_covariances[:-1]
         Vxn = smoothed_covariances[1:]
         Expxn = smoothed_cross_covariances
-
-        # Append bias to the inputs
-        # inputs = jnp.concatenate((inputs, jnp.ones((num_timesteps, 1))), axis=1)
         up = inputs[:-1]
 
-        # expected sufficient statistics for the initial distribution
+        ## expected sufficient statistics for the initial distribution
         Ex0 = smoothed_means[0]
         Ex0x0T = smoothed_covariances[0] + jnp.outer(Ex0, Ex0)
         init_stats = (Ex0, Ex0x0T, 1)
+
+        # full E-step sufficient stats for initial wGP
         if self.use_initial_prior:
             m0_targets = Ex0.reshape(1, 1, self.state_dim)
             XTX_m0 = jnp.ones((1, 1, 1))
@@ -951,43 +1021,35 @@ class CLDS2:
         else:
             init_gp_stats = None
 
-        # expected sufficient statistics for the dynamics
+        ## expected sufficient statistics for the dynamics
         # let zp[t] = [x[t], u[t]] for t = 0...T-2
         # let xn[t] = x[t+1]          for t = 0...T-2
         sum_xpxpT = Vxp.sum(0) + Exp.T @ Exp
         sum_xpxnT = Expxn.sum(0)
-
+        sum_xnxnT = Vxn.sum(0) + Exn.T @ Exn
         if self.use_dynamics_bias:
             bp = jnp.ones((num_timesteps - 1, 1))
             sum_xpT = Exp.T @ bp
             sum_xpxpT = jnp.block([[sum_xpxpT, sum_xpT], [sum_xpT.T, bp.T @ bp]])
             sum_xpxnT = jnp.block([[Expxn.sum(0)], [bp.T @ Exn]])
-
-        sum_xnxnT = Vxn.sum(0) + Exn.T @ Exn
         dynamics_stats = (sum_xpxpT, sum_xpxnT, sum_xnxnT, num_timesteps - 1)
 
-        # full E-step sufficient stats
+        # full E-step sufficient stats for dynamics wGP
         if self.use_dynamics_prior:
-            ExpxpT = jnp.einsum("ti,tj->tij", Exp, Exp) + Vxp
             _Phi = self.priors["dynamics"].evaluate_basis(up)
-
-            # (LD2 x LD2), (LD2 x D1)
+            ExpxpT = jnp.einsum("ti,tj->tij", Exp, Exp) + Vxp
             sum_zpzpT, sum_zpxnT = weightspace_stats(_Phi, XTX=ExpxpT, XTY=Expxn)
             if self.use_dynamics_bias:
-                # (L x LD2), (L x D1)
                 sum_zpT, sum_znT = weightspace_stats(
                     _Phi, XTX=Exp[:, None, :], XTY=Exn[:, None, :]
                 )
-                # ((LD2+L) x (LD2+L)))
                 sum_zpzpT = jnp.block(
                     [
                         [sum_zpzpT, sum_zpT.T],
                         [sum_zpT, jnp.einsum("tk,tl->kl", _Phi, _Phi)],
                     ]
                 )
-                # ((LD2+L) x D1)
                 sum_zpxnT = jnp.concatenate([sum_zpxnT, sum_znT], axis=0)
-
             dynamics_gp_stats = (
                 sum_zpzpT,
                 params.dynamics_cov,
@@ -998,20 +1060,19 @@ class CLDS2:
         else:
             dynamics_gp_stats = None
 
-        # more expected sufficient statistics for the emissions
+        ## expected sufficient statistics for the emissions
         y = emissions
         sum_xxT = Vx.sum(0) + Ex.T @ Ex
         sum_xyT = Ex.T @ y
         sum_yyT = emissions.T @ emissions
-
         if self.use_emissions_bias:
             b = jnp.ones((num_timesteps, 1))
             sum_xT = Ex.T @ b
             sum_xxT = jnp.block([[sum_xxT, sum_xT], [sum_xT.T, b.T @ b]])
             sum_xyT = jnp.block([[sum_xyT], [b.T @ y]])
-
         emission_stats = (sum_xxT, sum_xyT, sum_yyT, num_timesteps)
 
+        # full E-step sufficient stats for emissions wGP
         if self.use_emissions_prior:
             _Phi = self.priors["emissions"].evaluate_basis(inputs)
             ExxT = jnp.einsum("ti,tj->tij", Ex, Ex) + Vx
@@ -1037,7 +1098,6 @@ class CLDS2:
                 sum_yyT,
                 num_timesteps,
             )
-
         else:
             emissions_gp_stats = None
 
@@ -1074,20 +1134,11 @@ class CLDS2:
                 assume_a="pos",
             )
             weights = weights.reshape(
-                wgp_prior.input_dim, wgp_prior.n_basis_funcs, wgp_prior.output_dim
-            ).transpose(1, 2, 0)
+                wgp_prior.n_basis_funcs, wgp_prior.input_dim, wgp_prior.output_dim
+            ).transpose(0, 2, 1)
             return weights
 
-        def fit_gplinear_regression_sylvester(ZTZ, Sigma, ZTY, wgp_prior):
-            # Solve a linear regression in weight-space given sufficient statistics
-            # weights = utils.jax_solve_sylvester(B, ZTZ, ZTY, assume_a='pos')
-            weights = utils.jax_solve_sylvester_BS(ZTZ, Sigma, ZTY)
-            weights = weights.reshape(
-                wgp_prior.input_dim, wgp_prior.n_basis_funcs, wgp_prior.output_dim
-            ).transpose(1, 2, 0)
-            return weights
-
-        def fit_gplinear_regression_sylvester2(
+        def fit_gplinear_regression_sylvester(
             ZTZ, Sigma, ZTY, YTY, N, wgp_prior, use_bias
         ):
             # Solve a linear regression in weight-space given sufficient statistics
@@ -1138,7 +1189,7 @@ class CLDS2:
 
         # Dynamics M-step
         _, _, Q = fit_linear_regression(*dynamics_stats, self.use_dynamics_bias)
-        As, bs, _ = fit_gplinear_regression_sylvester2(
+        As, bs, _ = fit_gplinear_regression_sylvester(
             *Ab_sylvester_stats,
             self.priors["dynamics"],
             self.use_dynamics_bias,
@@ -1152,7 +1203,7 @@ class CLDS2:
         Cs, ds, R = fit_linear_regression(*emission_stats, self.use_emissions_bias)
         if self.use_emissions_prior:
             # In weight space
-            Cs, ds, _ = fit_gplinear_regression_sylvester2(
+            Cs, ds, _ = fit_gplinear_regression_sylvester(
                 *Cd_sylvester_stats,
                 self.priors["emissions"],
                 self.use_emissions_bias,
@@ -1194,13 +1245,35 @@ class CLDS2:
 
     def fit(
         self,
-        emissions,
-        conditions,
+        emissions: Float[Array, "num_batches num_timesteps emission_dim"],
+        conditions: Float[Array, "num_batches num_timesteps input_dim"],
         initial_params: ParamsCLDS2 = None,
         num_iters: int = 50,
         seed: int = 2,
     ):
+        """
+        Fit the CLDS model to the emissions and conditions using the EM algorithm.
 
+        Parameters
+        ----------
+        emissions : Float[Array, "num_batches num_timesteps emission_dim"]
+            observed emissions data.
+        conditions : Float[Array, "num_batches num_timesteps input_dim"]
+            input conditions for the GP priors.
+        initial_params : ParamsCLDS2, optional
+            initial parameters for the model, by default None.
+        num_iters : int, optional
+            number of EM iterations, by default 50.
+        seed : int, optional
+            random seed for initialization, by default 2.
+
+        Returns
+        -------
+        params : ParamsCLDS2
+            fitted model parameters.
+        log_probs : list
+            log probabilities at each iteration.
+        """
         if emissions.ndim != 3:
             raise ValueError(
                 "emissions should be 3D, of shape (num_batches, num_timesteps, emission_dim)"
