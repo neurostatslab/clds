@@ -673,13 +673,13 @@ class CLDS2:
             )
         return priors
 
-    def initialize_params(self, num_samples: int, seed: int = 2):
+    def initialize_params(self, key: jxr.PRNGKey, num_samples: int):
         """
         Initialize the model parameters based on the priors and flags.
         If priors are used, GP weights are sampled from the priors.
         If priors are not used, static parameters are randomly initialized.
         """
-        Ab_key, Cd_key, m0_key = jxr.split(jxr.PRNGKey(seed), 3)
+        Ab_key, Cd_key, m0_key = jxr.split(key, 3)
 
         def get_params(key, use_prior, prior, input_dim, output_dim, use_bias):
             if use_prior:
@@ -725,7 +725,7 @@ class CLDS2:
         if self.use_initial_prior:
             initial_mean = self.priors["init"].sample_weights(m0_key)
         else:
-            initial_mean = jxr.normal(m0_key, (num_samples, self.state_dim))
+            initial_mean = jxr.normal(m0_key, self.state_dim)
 
         # pack together
         return ParamsCLDS2(
@@ -789,11 +789,12 @@ class CLDS2:
         def f(x, args):
             A, b, C, d, (dy_key, em_key) = args
 
+            dynamics_noise = jxr.multivariate_normal(dy_key, jnp.zeros(Q.shape[0]), Q)
+            x_next = A @ x + b + dynamics_noise
+
             emissions_noise = jxr.multivariate_normal(em_key, jnp.zeros(R.shape[0]), R)
             y = C @ x + d + emissions_noise
 
-            dynamics_noise = jxr.multivariate_normal(dy_key, jnp.zeros(Q.shape[0]), Q)
-            x_next = A @ x + b + dynamics_noise
             return x_next, (x_next, y)
 
         x_init = jxr.multivariate_normal(key, m0, S0)
@@ -802,9 +803,13 @@ class CLDS2:
         xs = jnp.concatenate((x_init[None, :], x_nexts[:-1]), axis=0)
         return xs, ys
 
-    def predict(self, inputs: Float[Array, "num_timesteps input_dim"], seed: int = 2):
+    def sample(
+        self,
+        inputs: Float[Array, "num_timesteps input_dim"],
+        key: jxr.PRNGKey = jxr.PRNGKey(0),
+    ):
         """
-        Predict the states and emissions given the inputs as conditions and the fitted model parameters.
+        Sample the states and emissions given the inputs as conditions and the fitted model parameters.
 
         Parameters
         ----------
@@ -822,7 +827,6 @@ class CLDS2:
         """
         if self.params is None:
             raise ValueError("Model parameters have not been fit. Call fit() first.")
-        key = jxr.PRNGKey(seed)
         As, Cs, bs, ds, m0 = self.weights_to_params(self.params, inputs)
         return CLDS2.run_dynamics(
             key,
@@ -839,13 +843,16 @@ class CLDS2:
     def log_prior(self, params: ParamsCLDS2, inputs):
         """Compute the log prior of the parameters."""
 
-        logprior_Ab = self.priors["dynamics"].log_prob_weights(
-            params.dynamics_weights
-        ) + (
-            self.priors["dynamics"].log_prob_weights(params.dynamics_bias)
-            if self.use_dynamics_bias
-            else 0.0
-        )
+        if self.use_dynamics_prior:
+            logprior_Ab = self.priors["dynamics"].log_prob_weights(
+                params.dynamics_weights
+            ) + (
+                self.priors["dynamics"].log_prob_weights(params.dynamics_bias)
+                if self.use_dynamics_bias
+                else 0.0
+            )
+        else:
+            logprior_Ab = 0.0
 
         if self.use_emissions_prior:
             logprior_Cd = self.priors["emissions"].log_prob_weights(
@@ -941,6 +948,17 @@ class CLDS2:
             smooth_params.smoothed_cross_covariances,
         )
         return smooth_params.marginal_loglik, filter_results, smoother_results
+
+        # lgssm_params = {
+        #     "m0": m0,
+        #     "S0": params.initial_cov,
+        #     "As": As,
+        #     "bs": bs,
+        #     "Q": params.dynamics_cov,
+        #     "Cs": Cs,
+        #     "R": params.emissions_cov,
+        # }
+        # return utils.lgssm_smoother(**lgssm_params, ys=emissions)
 
     def e_step(
         self,
@@ -1105,9 +1123,9 @@ class CLDS2:
             init_stats,
             init_gp_stats,
             dynamics_stats,
+            dynamics_gp_stats,
             emission_stats,
             emissions_gp_stats,
-            dynamics_gp_stats,
         ), marginal_loglik
 
     def m_step(
@@ -1174,26 +1192,29 @@ class CLDS2:
             init_stats,
             init_gp_stats,
             dynamics_stats,
+            dynamics_gp_stats,
             emission_stats,
-            Cd_sylvester_stats,
-            Ab_sylvester_stats,
+            emissions_gp_stats,
         ) = stats
 
         # Perform MLE estimation jointly
         sum_x0, sum_x0x0T, N = init_stats
         S = sum_x0x0T / N - jnp.outer(sum_x0, sum_x0) / (N**2)
+        # S = (sum_x0x0T - jnp.outer(sum_x0, sum_x0)) / N
+
         if self.use_initial_prior:
             m = fit_gplinear_regression(*init_gp_stats, self.priors["init"])
         else:
             m = sum_x0 / N
 
         # Dynamics M-step
-        _, _, Q = fit_linear_regression(*dynamics_stats, self.use_dynamics_bias)
-        As, bs, _ = fit_gplinear_regression_sylvester(
-            *Ab_sylvester_stats,
-            self.priors["dynamics"],
-            self.use_dynamics_bias,
-        )
+        As, bs, Q = fit_linear_regression(*dynamics_stats, self.use_dynamics_bias)
+        if self.use_dynamics_prior:
+            As, bs, _ = fit_gplinear_regression_sylvester(
+                *dynamics_gp_stats,
+                self.priors["dynamics"],
+                self.use_dynamics_bias,
+            )
 
         # # Use the following for homogeneous bias
         # b = jnp.mean(bs, axis=0)
@@ -1204,13 +1225,13 @@ class CLDS2:
         if self.use_emissions_prior:
             # In weight space
             Cs, ds, _ = fit_gplinear_regression_sylvester(
-                *Cd_sylvester_stats,
+                *emissions_gp_stats,
                 self.priors["emissions"],
                 self.use_emissions_bias,
             )
 
         # logger.warning('Warning, fixing Q and R')
-        # Q = jnp.eye(self.state_dim) # Can fix Q to be identity (for identifiability)
+        # Q = jnp.eye(self.state_dim)  # Can fix Q to be identity (for identifiability)
         # R = jnp.eye(self.emission_dim)
         params = ParamsCLDS2(
             initial_mean=m,
@@ -1281,7 +1302,9 @@ class CLDS2:
 
         if (self.initial_params is None) and (initial_params is None):
             # use default initialization if no initial params provided
-            initial_params = self.initialize_params(emissions.shape[1], seed)
+            initial_params = self.initialize_params(
+                jxr.PRNGKey(seed), emissions.shape[1]
+            )
         elif (self.initial_params is not None) and (initial_params is None):
             # use previously stored initial params if no initial params provided
             initial_params = self.initial_params
@@ -1331,4 +1354,4 @@ class CLDS2:
             )
 
         self.params = params
-        return params, log_probs
+        return params, log_probs, marginal_log_liks

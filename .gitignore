@@ -162,3 +162,4 @@ notebooks/.DS_Store
 # Data files
 data/
 notebooks/Mouse32-140822.nwb
+.vscode/settings.json

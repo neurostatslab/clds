@@ -11,7 +11,7 @@ def simulate_hd_dynamics(theta, epsilon=0.1, noise_scale=0.2):
     m0 = jnp.array(
         [jnp.cos(theta[0]), jnp.sin(theta[0])]
     )  # Change to 0 if needed for composite dynamics
-    S0 = noise_scale * jnp.eye(2)
+    S0 = noise_scale**2 * jnp.eye(2)
 
     # dynamics
     u = jnp.array([jnp.cos(theta), jnp.sin(theta)])
@@ -61,4 +61,4 @@ def simulate_hd_data(
     X = jnp.stack(X, axis=0)
     Y = jnp.stack(Y, axis=0)
 
-    return thetas, X, Y, true_Cs
+    return thetas, X, Y
