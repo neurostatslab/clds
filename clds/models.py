@@ -918,8 +918,8 @@ class CLDS2:
         """inputs as conditions"""
         # Format params
         As, Cs, bs, ds, m0 = self.weights_to_params(params, inputs)
-        Q = params.dynamics_cov
-        R = params.emissions_cov
+        # Q = params.dynamics_cov
+        # R = params.emissions_cov
 
         # force dynamics to retain the last valid state if mask is provided
         if mask is not None:
@@ -928,12 +928,12 @@ class CLDS2:
             Cs = jnp.where(mask[:, None, None], Cs, jnp.zeros_like(Cs))
             ds = jnp.where(mask[:, None], ds, 0.0)
             emissions = jnp.where(mask[:, None], emissions, 0.0)
-            Q = jnp.where(
-                mask[:, None, None], jnp.tile(Q[None], (len(mask), 1, 1)), 0.0
-            )
-            R = jnp.where(
-                mask[:, None, None], jnp.tile(R[None], (len(mask), 1, 1)), 0.0
-            )
+            # Q = jnp.where(
+            #     mask[:, None, None], jnp.tile(Q[None], (len(mask), 1, 1)), 0.0
+            # )
+            # R = jnp.where(
+            #     mask[:, None, None], jnp.tile(R[None], (len(mask), 1, 1)), 0.0
+            # )
 
         # Run the smoother
         lgssm_params = make_lgssm_params(
