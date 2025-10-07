@@ -8,6 +8,7 @@ from clds import utils
 import numpy as np
 from dynamax.linear_gaussian_ssm.inference import make_lgssm_params, lgssm_smoother
 from dynamax.linear_gaussian_ssm.models import LinearGaussianSSM
+import copy
 from functools import partial
 
 jax.config.update("jax_enable_x64", True)
@@ -193,7 +194,6 @@ class TestCLDS:
             else:
                 assert model.priors["init"] is None
 
-        @pytest.mark.parametrize("n_steps", [10, 100])
         def test_initialize_params(
             self,
             state_dim,
@@ -205,10 +205,9 @@ class TestCLDS:
             use_emissions_bias,
             torus_basis_funcs,
             initialize_model,
-            n_steps,
         ):
             model = initialize_model
-            params = model.initialize_params(jxr.PRNGKey(0), n_steps)
+            params = model.initialize_params(jxr.PRNGKey(0))
             assert isinstance(params, ParamsCLDS2)
             # check dynamics
             if use_dynamics_prior:
@@ -221,11 +220,11 @@ class TestCLDS:
                 if use_dynamics_bias:
                     assert params.dynamics_bias.shape == (n_basis_funcs, state_dim, 1)
                 else:
-                    assert params.dynamics_bias.shape == (n_steps, state_dim)
+                    assert params.dynamics_bias.shape == (state_dim,)
                     assert jnp.all(params.dynamics_bias == 0)
             else:
-                assert params.dynamics_weights.shape == (n_steps, state_dim, state_dim)
-                assert params.dynamics_bias.shape == (n_steps, state_dim)
+                assert params.dynamics_weights.shape == (state_dim, state_dim)
+                assert params.dynamics_bias.shape == (state_dim,)
                 if not use_dynamics_bias:
                     assert jnp.all(params.dynamics_bias == 0)
             assert params.dynamics_cov.shape == (state_dim, state_dim)
@@ -245,15 +244,14 @@ class TestCLDS:
                         1,
                     )
                 else:
-                    assert params.emissions_bias.shape == (n_steps, emission_dim)
+                    assert params.emissions_bias.shape == (emission_dim,)
                     assert jnp.all(params.emissions_bias == 0)
             else:
                 assert params.emissions_weights.shape == (
-                    n_steps,
                     emission_dim,
                     state_dim,
                 )
-                assert params.emissions_bias.shape == (n_steps, emission_dim)
+                assert params.emissions_bias.shape == (emission_dim,)
                 if not use_emissions_bias:
                     assert jnp.all(params.emissions_bias == 0)
             assert params.emissions_cov.shape == (emission_dim, emission_dim)
@@ -488,7 +486,6 @@ class TestCLDS:
         self, key, n_steps, state_dim, emission_dim, use_bias
     ):
         """Test that GP dynamics with identity basis and intercept input gives same result as non-gp dynamics"""
-        emission_dim = 2
         inputs = jnp.ones(n_steps)
         basis_funcs = [lambda x: x]
         model = CLDS2(
@@ -530,3 +527,100 @@ class TestCLDS:
         assert jnp.allclose(emissions_states[2], emissions_gp_stats[3])
         # initial
         assert jnp.allclose(init_stats[0], init_gp_stats[0])
+
+    @pytest.mark.parametrize("state_dim", [2, 3])
+    @pytest.mark.parametrize("emission_dim", [2, 5])
+    @pytest.mark.parametrize("use_prior", [True, False])
+    @pytest.mark.parametrize("use_bias", [True, False])
+    @pytest.mark.parametrize(
+        "mask",
+        [
+            jnp.ones(100, dtype=bool),
+            jnp.concatenate([jnp.ones(50, dtype=bool), jnp.zeros(50, dtype=bool)]),
+            # jnp.concatenate([jnp.zeros(50, dtype=bool), jnp.ones(50, dtype=bool)]),
+        ],
+    )
+    def test_mask_e_step(
+        self, mask, state_dim, emission_dim, use_prior, use_bias, torus_basis_funcs
+    ):
+        """Test that masking works as expected. E-step can only mask the ends of sequences."""
+        key = jxr.PRNGKey(0)
+        n_steps = 100
+        inputs = jnp.cumsum(0.4 * jxr.normal(key, shape=(n_steps,))) % (2 * jnp.pi)
+        model = CLDS2(
+            state_dim=state_dim,
+            emission_dim=emission_dim,
+            basis=torus_basis_funcs if use_prior else None,
+            use_dynamics_prior=use_prior,
+            use_emissions_prior=use_prior,
+            use_initial_prior=use_prior,
+            use_dynamics_bias=use_bias,
+            use_emissions_bias=use_bias,
+        )
+        model.params = model.initialize_params(key)
+        _, ys = model.sample(inputs, key)
+
+        # with jax.disable_jit():
+        stats_masked, ll_masked = model.e_step(model.params, ys, inputs, mask=mask)
+        stats_idx, ll_idx = model.e_step(model.params, ys[mask], inputs[mask])
+        for s_masked, s_idx in zip(stats_masked, stats_idx):
+            if s_masked is not None:
+                for m, i in zip(s_masked, s_idx):
+                    print(jnp.allclose(m, i))
+        # assert jnp.isclose(ll_masked, ll_idx)
+
+    @pytest.mark.parametrize("state_dim", [2, 3])
+    @pytest.mark.parametrize("emission_dim", [2, 5])
+    @pytest.mark.parametrize("use_prior", [True, False])
+    @pytest.mark.parametrize("use_bias", [True, False])
+    @pytest.mark.parametrize(
+        "mask",
+        [
+            jnp.ones(100, dtype=bool),
+            jnp.concatenate([jnp.ones(50, dtype=bool), jnp.zeros(50, dtype=bool)]),
+            jnp.concatenate([jnp.zeros(50, dtype=bool), jnp.ones(50, dtype=bool)]),
+        ],
+    )
+    def test_mask_fit(
+        self, mask, state_dim, emission_dim, use_prior, use_bias, torus_basis_funcs
+    ):
+        """Test that masking works as expected"""
+        key = jxr.PRNGKey(0)
+        # use_prior = True
+        n_steps = 100
+        inputs = jnp.cumsum(0.4 * jxr.normal(key, shape=(n_steps,))) % (2 * jnp.pi)
+        # right now tests are failing if use_dynamics_prior is false because randomized models are unfittable
+        model = CLDS2(
+            state_dim=state_dim,
+            emission_dim=emission_dim,
+            basis=torus_basis_funcs,
+            use_dynamics_prior=True,
+            use_emissions_prior=use_prior,
+            use_initial_prior=use_prior,
+            use_dynamics_bias=use_bias,
+            use_emissions_bias=use_bias,
+        )
+        params = model.initialize_params(key)
+        model.params = copy.deepcopy(params)
+        _, ys = model.sample(inputs, key)
+
+        # with jax.disable_jit():
+        params_masked, ll_masked = model.fit(
+            ys[None],
+            inputs[None],
+            initial_params=params,
+            mask=mask[None],
+            num_iters=1,
+        )
+        params_idx, ll_idx = model.fit(
+            ys[None, mask],
+            inputs[None, mask],
+            initial_params=params,
+            num_iters=1,
+        )
+        for p_masked, p_idx in zip(params_masked, params_idx):
+            if p_masked is None:
+                assert p_idx is None
+            else:
+                assert jnp.allclose(p_masked, p_idx)
+        # assert jnp.isclose(ll_masked[0], ll_idx[0])

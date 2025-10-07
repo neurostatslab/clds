@@ -673,7 +673,7 @@ class CLDS2:
             )
         return priors
 
-    def initialize_params(self, key: jxr.PRNGKey, num_samples: int):
+    def initialize_params(self, key: jxr.PRNGKey, noise_scale: float = 0.2):
         """
         Initialize the model parameters based on the priors and flags.
         If priors are used, GP weights are sampled from the priors.
@@ -688,16 +688,11 @@ class CLDS2:
                     bias = weights[:, :, -1:]
                     weights = weights[:, :, :-1]
                 else:
-                    bias = jnp.zeros((num_samples, output_dim))
+                    bias = jnp.zeros(output_dim)
             else:
-                weights = jnp.tile(
-                    jxr.normal(key, (output_dim, input_dim)),
-                    (num_samples, 1, 1),
-                )
+                weights = jxr.normal(key, (output_dim, input_dim))
                 bias = (
-                    jnp.tile(jxr.normal(key, (output_dim)), (num_samples, 1))
-                    if use_bias
-                    else jnp.zeros((num_samples, output_dim))
+                    jxr.normal(key, (output_dim)) if use_bias else jnp.zeros(output_dim)
                 )
             return weights, bias
 
@@ -734,9 +729,9 @@ class CLDS2:
             emissions_weights=emissions_weights,
             emissions_bias=emissions_bias,
             initial_mean=initial_mean,
-            initial_cov=jnp.eye(self.state_dim),
-            dynamics_cov=jnp.eye(self.state_dim),
-            emissions_cov=jnp.eye(self.emission_dim),
+            initial_cov=noise_scale**2 * jnp.eye(self.state_dim),
+            dynamics_cov=noise_scale**2 * jnp.eye(self.state_dim),
+            emissions_cov=noise_scale**2 * jnp.eye(self.emission_dim),
         )
 
     @staticmethod
@@ -843,28 +838,28 @@ class CLDS2:
     def log_prior(self, params: ParamsCLDS2, inputs):
         """Compute the log prior of the parameters."""
 
-        if self.use_dynamics_prior:
-            logprior_Ab = self.priors["dynamics"].log_prob_weights(
-                params.dynamics_weights
-            ) + (
-                self.priors["dynamics"].log_prob_weights(params.dynamics_bias)
-                if self.use_dynamics_bias
-                else 0.0
-            )
-        else:
-            logprior_Ab = 0.0
+        def get_log_prior(use_prior, prior, weights, bias, use_bias):
+            if use_prior:
+                return prior.log_prob_weights(weights) + (
+                    prior.log_prob_weights(bias) if use_bias else 0.0
+                )
+            else:
+                return 0.0
 
-        if self.use_emissions_prior:
-            logprior_Cd = self.priors["emissions"].log_prob_weights(
-                params.emissions_weights
-            ) + (
-                self.priors["emissions"].log_prob_weights(params.emissions_bias)
-                if self.use_emissions_bias
-                else 0.0
-            )
-
-        else:
-            logprior_Cd = 0.0
+        logprior_Ab = get_log_prior(
+            self.use_dynamics_prior,
+            self.priors["dynamics"],
+            params.dynamics_weights,
+            params.dynamics_bias,
+            self.use_dynamics_bias,
+        )
+        logprior_Cd = get_log_prior(
+            self.use_emissions_prior,
+            self.priors["emissions"],
+            params.emissions_weights,
+            params.emissions_bias,
+            self.use_emissions_bias,
+        )
 
         if self.use_initial_prior:
             logprior_m0 = self.priors["init"].log_prob_weights(params.initial_mean)
@@ -876,43 +871,41 @@ class CLDS2:
     def weights_to_params(self, params, inputs):
         """Transform weights of weight space into parameters.
         Implement as needed for all weight-space GP priors."""
-        if self.use_dynamics_prior:
-            As = self.priors["dynamics"](params.dynamics_weights, inputs)
-            bs = (
-                self.priors["dynamics"](params.dynamics_bias, inputs)
-                if self.use_dynamics_bias
-                else jnp.zeros((inputs.shape[0], self.state_dim))
-            )
-        else:
-            As = params.dynamics_weights
-            if As.ndim == 2:
-                As = jnp.tile(As[None], (len(inputs), 1, 1))
-            bs = (
-                params.dynamics_bias
-                if self.use_dynamics_bias
-                else jnp.zeros((inputs.shape[0], self.state_dim))
-            )
-            if bs.shape[0] != len(inputs):
-                bs = jnp.tile(bs, (len(inputs), 1, 1))
 
-        if self.use_emissions_prior:
-            Cs = self.priors["emissions"](params.emissions_weights, inputs)
-            ds = (
-                self.priors["emissions"](params.emissions_bias, inputs)
-                if self.use_emissions_bias
-                else jnp.zeros((inputs.shape[0], self.emission_dim))
-            )
-        else:
-            Cs = params.emissions_weights
-            if Cs.ndim == 2:
-                Cs = jnp.tile(Cs[None], (len(inputs), 1, 1))
-            ds = (
-                params.emissions_bias
-                if self.use_emissions_bias
-                else jnp.zeros((inputs.shape[0], self.emission_dim))
-            )
-            if ds.shape[0] != len(inputs):
-                ds = jnp.tile(ds, (len(inputs), 1, 1))
+        def get_params(use_prior, prior, weights, bias, inputs, use_bias):
+            if use_prior:
+                A = prior(weights, inputs)
+                b = (
+                    prior(bias, inputs)
+                    if use_bias
+                    else jnp.zeros((inputs.shape[0], A.shape[1]))
+                )
+            else:
+                A = weights
+                if A.ndim == 2:
+                    A = jnp.tile(A[None], (len(inputs), 1, 1))
+                b = bias if use_bias else jnp.zeros((inputs.shape[0], A.shape[1]))
+                if b.shape[0] != len(inputs):
+                    b = jnp.tile(b, (len(inputs), 1, 1))
+            return A, b
+
+        As, bs = get_params(
+            self.use_dynamics_prior,
+            self.priors["dynamics"],
+            params.dynamics_weights,
+            params.dynamics_bias,
+            inputs,
+            self.use_dynamics_bias,
+        )
+
+        Cs, ds = get_params(
+            self.use_emissions_prior,
+            self.priors["emissions"],
+            params.emissions_weights,
+            params.emissions_bias,
+            inputs,
+            self.use_emissions_bias,
+        )
 
         m0 = (
             self.priors["init"](params.initial_mean, inputs)[0]
@@ -921,10 +914,26 @@ class CLDS2:
         )  #! Some unnecessary computation, keeping only t=0
         return As, Cs, bs.squeeze(), ds.squeeze(), m0.squeeze()
 
-    def smoother(self, params: ParamsCLDS, emissions, inputs):
+    def smoother(self, params: ParamsCLDS, emissions, inputs, mask=None):
         """inputs as conditions"""
         # Format params
         As, Cs, bs, ds, m0 = self.weights_to_params(params, inputs)
+        Q = params.dynamics_cov
+        R = params.emissions_cov
+
+        # force dynamics to retain the last valid state if mask is provided
+        if mask is not None:
+            As = jnp.where(mask[:, None, None], As, jnp.eye(As.shape[1]))
+            bs = jnp.where(mask[:, None], bs, 0.0)
+            Cs = jnp.where(mask[:, None, None], Cs, jnp.zeros_like(Cs))
+            ds = jnp.where(mask[:, None], ds, 0.0)
+            emissions = jnp.where(mask[:, None], emissions, 0.0)
+            Q = jnp.where(
+                mask[:, None, None], jnp.tile(Q[None], (len(mask), 1, 1)), 0.0
+            )
+            R = jnp.where(
+                mask[:, None, None], jnp.tile(R[None], (len(mask), 1, 1)), 0.0
+            )
 
         # Run the smoother
         lgssm_params = make_lgssm_params(
@@ -938,15 +947,32 @@ class CLDS2:
             emissions_bias=ds,
         )
         smooth_params = lgssm_smoother(lgssm_params, emissions=emissions)
-        filter_results = (
-            smooth_params.filtered_means,
-            smooth_params.filtered_covariances,
-        )
-        smoother_results = (
-            smooth_params.smoothed_means,
-            smooth_params.smoothed_covariances,
-            smooth_params.smoothed_cross_covariances,
-        )
+
+        # mask results
+        if mask is not None:
+            filter_results = (
+                jnp.where(mask[:, None], smooth_params.filtered_means, 0.0),
+                jnp.where(mask[:, None, None], smooth_params.filtered_covariances, 0.0),
+            )
+            smoother_results = (
+                jnp.where(mask[:, None], smooth_params.smoothed_means, 0.0),
+                jnp.where(mask[:, None, None], smooth_params.smoothed_covariances, 0.0),
+                jnp.where(
+                    mask[1:, None, None],
+                    smooth_params.smoothed_cross_covariances,
+                    0.0,
+                ),
+            )
+        else:
+            filter_results = (
+                smooth_params.filtered_means,
+                smooth_params.filtered_covariances,
+            )
+            smoother_results = (
+                smooth_params.smoothed_means,
+                smooth_params.smoothed_covariances,
+                smooth_params.smoothed_cross_covariances,
+            )
         return smooth_params.marginal_loglik, filter_results, smoother_results
 
         # lgssm_params = {
@@ -965,6 +991,7 @@ class CLDS2:
         params: ParamsCLDS,
         emissions: Float[Array, "num_timesteps emission_dim"],
         inputs: Optional[Float[Array, "num_timesteps input_dim"]] = None,
+        mask: Optional[Float[Array, "num_timesteps"]] = None,
     ):
         def weightspace_stats(
             Phi: Float[Array, "n_steps n_basis_funcs"],
@@ -996,13 +1023,17 @@ class CLDS2:
             return ZTZ, ZTY
 
         """take inputs to be theta"""
-        num_timesteps = emissions.shape[0]
+        if mask is not None:
+            num_timesteps = mask.sum().astype(int)
+        else:
+            num_timesteps = emissions.shape[0]
+
         if inputs is None:
             inputs = jnp.zeros((num_timesteps, 1))
 
         # Run the smoother to get posterior expectations
         marginal_loglik, filter_results, smoother_results = self.smoother(
-            params, emissions, inputs
+            params, emissions, inputs, mask
         )
         smoothed_means, smoothed_covariances, smoothed_cross_covariances = (
             smoother_results
@@ -1016,7 +1047,16 @@ class CLDS2:
         Vxp = smoothed_covariances[:-1]
         Vxn = smoothed_covariances[1:]
         Expxn = smoothed_cross_covariances
+        b = jnp.ones((inputs.shape[0], 1))
+        y = emissions
         up = inputs[:-1]
+
+        # mask shorthand if needed
+        if mask is not None:
+            Exp = jnp.where(mask[1:, None], Exp, 0.0)
+            Vxp = jnp.where(mask[1:, None, None], Vxp, 0.0)
+            b = jnp.where(mask[:, None], b, 0.0)
+            y = jnp.where(mask[:, None], y, 0.0)
 
         ## expected sufficient statistics for the initial distribution
         Ex0 = smoothed_means[0]
@@ -1046,7 +1086,7 @@ class CLDS2:
         sum_xpxnT = Expxn.sum(0)
         sum_xnxnT = Vxn.sum(0) + Exn.T @ Exn
         if self.use_dynamics_bias:
-            bp = jnp.ones((num_timesteps - 1, 1))
+            bp = b[1:]
             sum_xpT = Exp.T @ bp
             sum_xpxpT = jnp.block([[sum_xpxpT, sum_xpT], [sum_xpT.T, bp.T @ bp]])
             sum_xpxnT = jnp.block([[Expxn.sum(0)], [bp.T @ Exn]])
@@ -1055,6 +1095,8 @@ class CLDS2:
         # full E-step sufficient stats for dynamics wGP
         if self.use_dynamics_prior:
             _Phi = self.priors["dynamics"].evaluate_basis(up)
+            if mask is not None:
+                _Phi = jnp.where(mask[1:, None], _Phi, 0.0)
             ExpxpT = jnp.einsum("ti,tj->tij", Exp, Exp) + Vxp
             sum_zpzpT, sum_zpxnT = weightspace_stats(_Phi, XTX=ExpxpT, XTY=Expxn)
             if self.use_dynamics_bias:
@@ -1079,12 +1121,10 @@ class CLDS2:
             dynamics_gp_stats = None
 
         ## expected sufficient statistics for the emissions
-        y = emissions
         sum_xxT = Vx.sum(0) + Ex.T @ Ex
         sum_xyT = Ex.T @ y
-        sum_yyT = emissions.T @ emissions
+        sum_yyT = y.T @ y
         if self.use_emissions_bias:
-            b = jnp.ones((num_timesteps, 1))
             sum_xT = Ex.T @ b
             sum_xxT = jnp.block([[sum_xxT, sum_xT], [sum_xT.T, b.T @ b]])
             sum_xyT = jnp.block([[sum_xyT], [b.T @ y]])
@@ -1093,6 +1133,8 @@ class CLDS2:
         # full E-step sufficient stats for emissions wGP
         if self.use_emissions_prior:
             _Phi = self.priors["emissions"].evaluate_basis(inputs)
+            if mask is not None:
+                _Phi = jnp.where(mask[:, None], _Phi, 0.0)
             ExxT = jnp.einsum("ti,tj->tij", Ex, Ex) + Vx
             ExyT = jnp.einsum("ti,tj->tij", Ex, y)
             sum_zzT, sum_zyT = weightspace_stats(_Phi, ExxT, ExyT)
@@ -1210,7 +1252,7 @@ class CLDS2:
         # Dynamics M-step
         As, bs, Q = fit_linear_regression(*dynamics_stats, self.use_dynamics_bias)
         if self.use_dynamics_prior:
-            As, bs, _ = fit_gplinear_regression_sylvester(
+            As, bs, Q = fit_gplinear_regression_sylvester(
                 *dynamics_gp_stats,
                 self.priors["dynamics"],
                 self.use_dynamics_bias,
@@ -1269,6 +1311,7 @@ class CLDS2:
         emissions: Float[Array, "num_batches num_timesteps emission_dim"],
         conditions: Float[Array, "num_batches num_timesteps input_dim"],
         initial_params: ParamsCLDS2 = None,
+        mask: Float[Array, "num_batches num_timesteps"] = None,
         num_iters: int = 50,
         seed: int = 2,
     ):
@@ -1283,6 +1326,8 @@ class CLDS2:
             input conditions for the GP priors.
         initial_params : ParamsCLDS2, optional
             initial parameters for the model, by default None.
+        mask : Float[Array, "num_batches num_timesteps"], optional
+            mask for missing data, by default None.
         num_iters : int, optional
             number of EM iterations, by default 50.
         seed : int, optional
@@ -1300,6 +1345,13 @@ class CLDS2:
                 "emissions should be 3D, of shape (num_batches, num_timesteps, emission_dim)"
             )
 
+        # apply mask to front load valid data
+        if mask is not None:
+            shift = jnp.argmax(mask, axis=1)
+            emissions = jax.vmap(partial(jnp.roll, axis=0))(emissions, -shift)
+            conditions = jax.vmap(partial(jnp.roll, axis=0))(conditions, -shift)
+            mask = jax.vmap(partial(jnp.roll, axis=0))(mask, -shift)
+
         if (self.initial_params is None) and (initial_params is None):
             # use default initialization if no initial params provided
             initial_params = self.initialize_params(
@@ -1313,9 +1365,11 @@ class CLDS2:
         self.initial_params = initial_params
 
         @jit
-        def em_step(params, emissions, conditions):
+        def em_step(params, emissions, conditions, mask):
             # Obtain current E-step stats and model log prob
-            batch_stats, lls = vmap(partial(self.e_step, params))(emissions, conditions)
+            batch_stats, lls = vmap(partial(self.e_step, params))(
+                emissions, conditions, mask
+            )
             log_priors = vmap(partial(self.log_prior, params))(conditions)
             mll = lls.sum()
             lp = log_priors.sum() + mll
@@ -1333,7 +1387,7 @@ class CLDS2:
         params = initial_params
         for i in pbar:
             next_params, (log_prob, marginal_log_lik) = em_step(
-                params, emissions, conditions
+                params, emissions, conditions, mask
             )
             log_probs.append(log_prob)
             marginal_log_liks.append(marginal_log_lik)
@@ -1354,4 +1408,4 @@ class CLDS2:
             )
 
         self.params = params
-        return params, log_probs, marginal_log_liks
+        return params, log_probs
