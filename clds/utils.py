@@ -163,7 +163,15 @@ def lgssm_filter(
             )
 
         # Predict the next state
-        pred_mean, pred_cov = _predict(filtered_mean, filtered_cov, As[t], bs[t], Q)
+        # pred_mean, pred_cov = _predict(filtered_mean, filtered_cov, As[t], bs[t], Q)
+        pred_mean, pred_cov = jax.lax.cond(
+            t < num_timesteps - 1,
+            lambda _: _predict(
+                filtered_mean, filtered_cov, As[t], bs[t], Q
+            ),
+            lambda _: (filtered_mean, filtered_cov), # handles last step
+            operand=None,
+        )
         return (ll, pred_mean, pred_cov), (filtered_mean, filtered_cov)
 
     # Run the Kalman filter
@@ -382,18 +390,32 @@ def Tm_basis(
     return basis_funcs
 
 
-# %%
-def logprob_analytic(
-    x: Float[Array, "N"], mu: Float[Array, "N"], cov: Float[Array, "N N"]
-) -> float:
-    """
-    Analytic log probability of a multivariate normal distribution. Handles singular covariance matrices.
-    """
-    N = x.shape[0]
-    z = jnp.linalg.solve(cov, x - mu)  # solve the linear system cov * z = x - mu
-    _, logdetC = jnp.linalg.slogdet(cov + 1e-06 * jnp.eye(N))
-    logprob = -(jnp.dot(x - mu, z) + logdetC + N * jnp.log(2.0 * jnp.pi)) / 2.0
-    return logprob
+# # %%
+# def logprob_analytic(
+#     x: Float[Array, "N"], mu: Float[Array, "N"], cov: Float[Array, "N N"]
+# ) -> float:
+#     """
+#     Analytic log probability of a multivariate normal distribution. Handles singular covariance matrices.
+#     """
+#     N = x.shape[0]
+#     z = jnp.linalg.solve(cov, x - mu)  # solve the linear system cov * z = x - mu
+#     _, logdetC = jnp.linalg.slogdet(cov + 1e-06 * jnp.eye(N))
+#     logprob = -(jnp.dot(x - mu, z) + logdetC + N * jnp.log(2.0 * jnp.pi)) / 2.0
+#     return logprob
+
+def logprob_analytic(x, mu, cov):
+    """Gaussian log density for a positive-definite covariance."""
+    cov = symmetrize(cov)
+    L = jnp.linalg.cholesky(cov)
+    z = jax.scipy.linalg.solve_triangular(
+        L, x - mu, lower=True
+    )
+    logdet = 2.0 * jnp.log(jnp.diag(L)).sum()
+    return -0.5 * (
+        jnp.dot(z, z)
+        + logdet
+        + x.shape[0] * jnp.log(2.0 * jnp.pi)
+    )
 
 
 # %%
@@ -404,7 +426,7 @@ def symmetrize(A):
     return 0.5 * (A + jnp.swapaxes(A, -1, -2))
 
 
-def psd_solve(A, b, diagonal_boost=1e-9):
+def psd_solve(A, b, diagonal_boost=0.0):
     """A wrapper for coordinating the linalg solvers used in the library for psd matrices."""
     A = symmetrize(A) + diagonal_boost * jnp.eye(A.shape[-1])
     L, lower = jax.scipy.linalg.cho_factor(A, lower=True)
@@ -432,7 +454,8 @@ def jax_solve_sylvester_BS(A, B, C, **kwargs):
         Y = jnp.zeros((n, m), dtype=C.dtype)
         for k in range(m):
             Y_k = jax.scipy.linalg.solve(
-                R + S[k, k] * jnp.eye(n), F[:, k] - Y[:, k + 1 :] @ S[k + 1 :, k]
+                R + S[k, k] * jnp.eye(n, dtype=R.dtype),
+                F[:, k] - Y[:, :k] @ S[:k, k], #F[:, k] - Y[:, k + 1 :] @ S[k + 1 :, k]
             )
             Y = Y.at[:, k].set(Y_k)
         return Y
@@ -451,6 +474,17 @@ def jax_solve_sylvester_BS(A, B, C, **kwargs):
     X = U @ Y @ V.T
     return X
 
+def solve_sylvester_symmetric(A, B, C):
+    # Appropriate when A and B are theoretically symmetric.
+    A = 0.5 * (A + A.T)
+    B = 0.5 * (B + B.T)
+
+    a, U = jnp.linalg.eigh(A)
+    b, V = jnp.linalg.eigh(B)
+
+    F = U.T @ C @ V
+    Y = F / (a[:, None] + b[None, :])
+    return U @ Y @ V.T
 
 def test_sylvester():
     key = jax.random.PRNGKey(0)
@@ -469,6 +503,198 @@ def test_sylvester():
     X_hat = jax_solve_sylvester_BS(A, B, C)
     assert jnp.allclose(X, X_hat, atol=1e-5), X - X_hat
 
+import math
+from functools import partial
+
+import jax
+import jax.numpy as jnp
+
+
+def test_dynamics_update(
+    model, params, emissions, conditions, mask,
+    atol=1e-3, rtol=1e-6,
+):
+    # One E-step; freeze these statistics for the comparison.
+    batch_stats, lls_old = jax.vmap(partial(model.e_step, params))(
+        emissions, conditions, mask
+    )
+    G, _, H, YTY, N = jax.tree_util.tree_map(
+        lambda x: jnp.sum(x, axis=0),
+        batch_stats[3],  # dynamics_gp_stats
+    )
+
+    def pack(p):
+        weights = p.dynamics_weights
+        W = weights.transpose(0, 2, 1).reshape(-1, weights.shape[1])
+        if model.use_dynamics_bias:
+            W = jnp.concatenate([W, p.dynamics_bias[..., 0]], axis=0)
+        return W
+
+    def dynamics_objective(p):
+        W, Q = pack(p), p.dynamics_cov
+        residual_sum = YTY - W.T @ H - H.T @ W + W.T @ G @ W
+        L = jnp.linalg.cholesky(Q)
+        logdet = 2 * jnp.log(jnp.diag(L)).sum()
+        return -0.5 * (
+            N * logdet
+            + jnp.trace(jnp.linalg.solve(Q, residual_sum))
+            + jnp.sum(W**2)
+        )
+
+    # Compute the full proposal, but retain only its dynamics updates.
+    proposal = model.m_step(params, batch_stats)
+    params_dyn = type(params)(
+        initial_mean=params.initial_mean,
+        initial_cov=params.initial_cov,
+        dynamics_weights=proposal.dynamics_weights,
+        dynamics_bias=proposal.dynamics_bias,
+        dynamics_cov=params.dynamics_cov,  # Keep Q fixed for this test.
+        emissions_weights=params.emissions_weights,
+        emissions_bias=params.emissions_bias,
+        emissions_cov=params.emissions_cov,
+    )
+
+    # Recompute the actual likelihood at the dynamics-only proposal.
+    _, lls_dyn = jax.vmap(partial(model.e_step, params_dyn))(
+        emissions, conditions, mask
+    )
+
+    lp_old = float(lls_old.sum() + model.log_prior(params))
+    lp_dyn = float(lls_dyn.sum() + model.log_prior(params_dyn))
+    f_old = float(dynamics_objective(params))
+    f_dyn = float(dynamics_objective(params_dyn))
+
+    assert bool(jnp.array_equal(
+        params_dyn.dynamics_cov, params.dynamics_cov
+    ))
+
+    W0 = pack(params)
+    dW = pack(params_dyn) - W0
+    Q0 = params.dynamics_cov
+
+    # Derivative predicted by the frozen posterior statistics.
+    grad_likelihood = jnp.linalg.solve(
+        Q0, (H - G @ W0).T
+    ).T
+
+    expected_likelihood_slope = jnp.sum(grad_likelihood * dW)
+    expected_prior_slope = -jnp.sum(W0 * dW)
+
+    # Differentiate the actual likelihood and prior independently.
+    def actual_terms(p):
+        _, trial_lls = jax.vmap(partial(model.e_step, p))(
+            emissions, conditions, mask
+        )
+        return jnp.stack([
+            trial_lls.sum(),
+            model.log_prior(p),
+        ])
+
+    # Only dynamics weights/bias should differ between these parameters.
+    direction = jax.tree_util.tree_map(
+        lambda old, new: new - old,
+        params,
+        params_dyn,
+    )
+
+    _, actual_slopes = jax.jvp(
+        actual_terms,
+        (params,),
+        (direction,),
+    )
+
+    print(
+        "Likelihood slope: "
+        f"actual={float(actual_slopes[0]):.12f}, "
+        f"from moments={float(expected_likelihood_slope):.12f}, "
+        f"gap={float(actual_slopes[0] - expected_likelihood_slope):.3e}"
+    )
+    print(
+        "Prior slope:      "
+        f"actual={float(actual_slopes[1]):.12f}, "
+        f"from weights={float(expected_prior_slope):.12f}, "
+        f"gap={float(actual_slopes[1] - expected_prior_slope):.3e}"
+    )
+
+    assert all(math.isfinite(v) for v in [lp_old, lp_dyn, f_old, f_dyn])
+
+    delta_lp = lp_dyn - lp_old
+    delta_f = f_dyn - f_old
+    gap = delta_lp - delta_f
+
+    # Separate tolerances for the two comparisons.
+    tol_f = atol + rtol * max(abs(f_old), abs(f_dyn))
+    tol_bound = tol_f + atol + rtol * max(abs(lp_old), abs(lp_dyn))
+
+    print(f"Log posterior: {lp_old:.6f} -> {lp_dyn:.6f}")
+    print(f"Dynamics surrogate improvement: {delta_f:.6f}")
+    print(f"Actual MAP improvement:         {delta_lp:.6f}")
+    print(f"EM bound gap (should be >= 0):  {gap:.6f}")
+    print(f"Bound tolerance:               {tol_bound:.6f}")
+
+    assert delta_f >= -tol_f, "Dynamics surrogate decreased."
+    assert gap >= -tol_bound, (
+        "EM bound failed: actual MAP improvement is smaller "
+        "than the dynamics surrogate improvement."
+    )
+
+    return params_dyn, {
+        "delta_log_posterior": delta_lp,
+        "delta_surrogate": delta_f,
+        "bound_gap": gap,
+    }
+
+def diagnose_em_blocks(model, params, emissions, conditions, mask=None):
+    axes = (0, 0, None if mask is None else 0)
+
+    batch_stats, lls_old = jax.vmap(
+        lambda y, u, m: model.e_step(params, y, u, m),
+        in_axes=axes,
+    )(emissions, conditions, mask)
+
+    proposal = model.m_step(params, batch_stats)
+
+    ll_old = lls_old.sum()
+    prior_old = model.log_prior(params)
+    n_trials = emissions.shape[0]
+
+    groups = {
+        "dynamics": (
+            "dynamics_weights", "dynamics_bias", "dynamics_cov",
+        ),
+        "emissions": (
+            "emissions_weights", "emissions_bias", "emissions_cov",
+        ),
+        "initial": (
+            "initial_mean", "initial_cov",
+        ),
+    }
+    all_fields = tuple(k for fields in groups.values() for k in fields)
+    groups["all"] = all_fields
+
+    for name, changed_fields in groups.items():
+        candidate = type(params)(**{
+            k: getattr(proposal if k in changed_fields else params, k)
+            for k in all_fields
+        })
+
+        lls_new = jax.vmap(
+            lambda y, u, m: model.smoother(candidate, y, u, m)[0],
+            in_axes=axes,
+        )(emissions, conditions, mask)
+
+        delta_ll = lls_new.sum() - ll_old
+        delta_prior = model.log_prior(candidate) - prior_old
+
+        print(
+            f"{name:>9}: "
+            f"Δlik={float(delta_ll):+.9f}, "
+            f"Δprior={float(delta_prior):+.9f}, "
+            f"ΔMAP={float(delta_ll + delta_prior):+.9f}, "
+            f"Δold_logging={float(delta_ll + n_trials * delta_prior):+.9f}"
+        )
+
+    return proposal
 
 if __name__ == "__main__":
     M_conditions = 1

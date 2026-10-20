@@ -36,9 +36,6 @@ from .params import (
 
 import clds.utils as utils
 
-import numpyro.distributions as dist
-
-
 # %%
 class WeightSpaceGaussianProcess:
     """
@@ -287,12 +284,12 @@ class CLDS:
             if self.wgps["m0"] is not None
             else params.m0
         )  #! Some unnecessary computation, keeping only t=0
-        return As, Cs, bs.squeeze(), m0.squeeze()
+        return As, Cs, bs.squeeze(), None, m0.squeeze()
 
     def smoother(self, params: ParamsCLDS, emissions, inputs):
         """inputs as conditions"""
         # Format params
-        As, Cs, bs, m0 = self.weights_to_params(params, inputs)
+        As, Cs, bs, _, m0 = self.weights_to_params(params, inputs)
         if Cs.ndim == 2:
             Cs = jnp.tile(Cs[None], (len(inputs), 1, 1))
 
@@ -560,8 +557,8 @@ class CLDS:
             m0_gp_weights=W_m0,
             Cs=Cs,
             bs=bs,
-            Q=Q,
-            R=R,
+            Q=utils.symmetrize(Q),
+            R=utils.symmetrize(R),
         )
         return params
 
@@ -673,7 +670,7 @@ class CLDS2:
             )
         return priors
 
-    def initialize_params(self, key: jxr.PRNGKey, noise_scale: float = 0.2):
+    def initialize_params(self, key: jxr.PRNGKey, noise_scale: float = 1.0):
         """
         Initialize the model parameters based on the priors and flags.
         If priors are used, GP weights are sampled from the priors.
@@ -835,7 +832,7 @@ class CLDS2:
             self.params.initial_cov,
         )
 
-    def log_prior(self, params: ParamsCLDS2, inputs):
+    def log_prior(self, params: ParamsCLDS2):
         """Compute the log prior of the parameters."""
 
         def get_log_prior(use_prior, prior, weights, bias, use_bias):
@@ -935,56 +932,73 @@ class CLDS2:
             #     mask[:, None, None], jnp.tile(R[None], (len(mask), 1, 1)), 0.0
             # )
 
-        # Run the smoother
-        lgssm_params = make_lgssm_params(
-            initial_mean=m0,
-            initial_cov=params.initial_cov,
-            dynamics_weights=As,
-            dynamics_cov=params.dynamics_cov,
-            dynamics_bias=bs,
-            emissions_weights=Cs,
-            emissions_cov=params.emissions_cov,
-            emissions_bias=ds,
+        # # Run the smoother
+        # lgssm_params = make_lgssm_params(
+        #     initial_mean=m0,
+        #     initial_cov=params.initial_cov,
+        #     dynamics_weights=As,
+        #     dynamics_cov=params.dynamics_cov,
+        #     dynamics_bias=bs,
+        #     emissions_weights=Cs,
+        #     emissions_cov=params.emissions_cov,
+        #     emissions_bias=ds,
+        # )
+        # smooth_params = lgssm_smoother(lgssm_params, emissions=emissions)
+        lgssm_params = {
+            "m0": m0,
+            "S0": params.initial_cov,
+            "As": As,
+            "bs": bs,
+            "Q": params.dynamics_cov,
+            "Cs": Cs,
+            "R": params.emissions_cov,
+            "ds": ds,
+        }
+
+        ll, filter_results, smoother_results = utils.lgssm_smoother(
+            **lgssm_params, ys=emissions
         )
-        smooth_params = lgssm_smoother(lgssm_params, emissions=emissions)
 
-        # mask results
         if mask is not None:
-            filter_results = (
-                jnp.where(mask[:, None], smooth_params.filtered_means, 0.0),
-                jnp.where(mask[:, None, None], smooth_params.filtered_covariances, 0.0),
+            #? Mask also filter/smoother results?
+            n_masked = jnp.sum(~mask.astype(bool))
+            zero = jnp.zeros(
+                (emissions.shape[-1],), dtype=emissions.dtype
             )
-            smoother_results = (
-                jnp.where(mask[:, None], smooth_params.smoothed_means, 0.0),
-                jnp.where(mask[:, None, None], smooth_params.smoothed_covariances, 0.0),
-                jnp.where(
-                    mask[1:, None, None],
-                    smooth_params.smoothed_cross_covariances,
-                    0.0,
-                ),
+            # Use the exact same log-density helper as the filter.
+            ll -= n_masked * utils.logprob_analytic(
+                zero, zero, params.emissions_cov
             )
-        else:
-            filter_results = (
-                smooth_params.filtered_means,
-                smooth_params.filtered_covariances,
-            )
-            smoother_results = (
-                smooth_params.smoothed_means,
-                smooth_params.smoothed_covariances,
-                smooth_params.smoothed_cross_covariances,
-            )
-        return smooth_params.marginal_loglik, filter_results, smoother_results
 
-        # lgssm_params = {
-        #     "m0": m0,
-        #     "S0": params.initial_cov,
-        #     "As": As,
-        #     "bs": bs,
-        #     "Q": params.dynamics_cov,
-        #     "Cs": Cs,
-        #     "R": params.emissions_cov,
-        # }
-        # return utils.lgssm_smoother(**lgssm_params, ys=emissions)
+        return ll, filter_results, smoother_results
+
+        # # mask results
+        # if mask is not None:
+        #     filter_results = (
+        #         jnp.where(mask[:, None], smooth_params.filtered_means, 0.0),
+        #         jnp.where(mask[:, None, None], smooth_params.filtered_covariances, 0.0),
+        #     )
+        #     smoother_results = (
+        #         jnp.where(mask[:, None], smooth_params.smoothed_means, 0.0),
+        #         jnp.where(mask[:, None, None], smooth_params.smoothed_covariances, 0.0),
+        #         jnp.where(
+        #             mask[1:, None, None],
+        #             smooth_params.smoothed_cross_covariances,
+        #             0.0,
+        #         ),
+        #     )
+        # else:
+        #     filter_results = (
+        #         smooth_params.filtered_means,
+        #         smooth_params.filtered_covariances,
+        #     )
+        #     smoother_results = (
+        #         smooth_params.smoothed_means,
+        #         smooth_params.smoothed_covariances,
+        #         smooth_params.smoothed_cross_covariances,
+        #     )
+        # return smooth_params.marginal_loglik, filter_results, smoother_results
+
 
     def e_step(
         self,
@@ -1204,6 +1218,26 @@ class CLDS2:
             # Solve a linear regression in weight-space given sufficient statistics
             # weights = utils.jax_solve_sylvester(B, ZTZ, ZTY, assume_a='pos')
             weights = utils.jax_solve_sylvester_BS(ZTZ, Sigma, ZTY)
+            # weights = utils.solve_sylvester_symmetric(ZTZ, Sigma, ZTY)
+
+            residual = ZTZ @ weights + weights @ Sigma - ZTY
+            relative_residual = (
+                jnp.linalg.norm(residual)
+                / jnp.maximum(jnp.linalg.norm(ZTY), 1e-12)
+            )
+
+            sigma_asymmetry = (
+                jnp.linalg.norm(Sigma - Sigma.T)
+                / jnp.maximum(jnp.linalg.norm(Sigma), 1e-12)
+            )
+
+            jax.debug.print(
+                "Sylvester residual: {r:.3e}, Sigma asymmetry: {s:.3e}",
+                r=relative_residual,
+                s=sigma_asymmetry,
+                ordered=True,
+            )
+
             Sigma = (
                 YTY - weights.T @ ZTY - ZTY.T @ weights + weights.T @ ZTZ @ weights
             ) / N
@@ -1228,6 +1262,23 @@ class CLDS2:
 
             return weights, bias, Sigma
 
+        # For testing purposes
+        def dynamics_objective(W, Q, G, H, YTY, N):
+            residual_sum = (
+                YTY - W.T @ H - H.T @ W + W.T @ G @ W
+            )
+            L = jnp.linalg.cholesky(Q)
+            logdet = 2 * jnp.log(jnp.diag(L)).sum()
+            return -0.5 * (
+                N * logdet
+                + jnp.trace(jnp.linalg.solve(Q, residual_sum))
+                + jnp.sum(W**2)
+            )
+
+        def pack_weights(weights, bias):
+            W = weights.transpose(0, 2, 1).reshape(-1, weights.shape[1])
+            return W if bias is None else jnp.concatenate([W, bias[..., 0]], axis=0)
+    
         # Sum the statistics across all batches
         stats = jax.tree_util.tree_map(partial(jnp.sum, axis=0), batch_stats)
         (
@@ -1240,36 +1291,63 @@ class CLDS2:
         ) = stats
 
         # Perform MLE estimation jointly
-        sum_x0, sum_x0x0T, N = init_stats
-        S = sum_x0x0T / N - jnp.outer(sum_x0, sum_x0) / (N**2)
-        # S = (sum_x0x0T - jnp.outer(sum_x0, sum_x0)) / N
-
+        sum_x0, sum_x0x0T, N0 = init_stats
         if self.use_initial_prior:
-            m = fit_gplinear_regression(*init_gp_stats, self.priors["init"])
+            # m = fit_gplinear_regression(*init_gp_stats, self.priors["init"])
+            G0, H0 = init_gp_stats
+
+            m, _, S = fit_gplinear_regression_sylvester(
+                G0,
+                params.initial_cov,
+                H0,
+                sum_x0x0T,
+                N0,
+                self.priors["init"],
+                use_bias=False,
+            )
         else:
-            m = sum_x0 / N
+            m = sum_x0 / N0
+            S = sum_x0x0T / N0 - jnp.outer(m, m)
 
         # Dynamics M-step
-        As, bs, Q = fit_linear_regression(*dynamics_stats, self.use_dynamics_bias)
         if self.use_dynamics_prior:
+            sum_zpzpT, _, sum_zpxnT, sum_xnxnT, N_transitions = dynamics_gp_stats
             As, bs, Q = fit_gplinear_regression_sylvester(
-                *dynamics_gp_stats,
+                sum_zpzpT, params.dynamics_cov, sum_zpxnT, sum_xnxnT, N_transitions,
                 self.priors["dynamics"],
                 self.use_dynamics_bias,
             )
+        else:
+            As, bs, Q = fit_linear_regression(*dynamics_stats, self.use_dynamics_bias)
 
         # # Use the following for homogeneous bias
         # b = jnp.mean(bs, axis=0)
         # bs = jnp.tile(b, (len(up), 1))
 
         # Emission M-step
-        Cs, ds, R = fit_linear_regression(*emission_stats, self.use_emissions_bias)
         if self.use_emissions_prior:
             # In weight space
-            Cs, ds, _ = fit_gplinear_regression_sylvester(
-                *emissions_gp_stats,
+            sum_zzT, _, sum_zyT, sum_yyT, N_emissions = emissions_gp_stats
+            Cs, ds, R = fit_gplinear_regression_sylvester(
+                sum_zzT, params.emissions_cov, sum_zyT, sum_yyT, N_emissions,
                 self.priors["emissions"],
                 self.use_emissions_bias,
+            )
+        else:
+            Cs, ds, R = fit_linear_regression(*emission_stats, self.use_emissions_bias)
+
+        # Check
+        if self.use_dynamics_prior:
+            W_old = pack_weights(params.dynamics_weights, params.dynamics_bias)
+            W_new = pack_weights(As, bs)
+            f_old = dynamics_objective(W_old, params.dynamics_cov, sum_zpzpT, sum_zpxnT, sum_xnxnT, N_transitions)
+            f_weights = dynamics_objective(W_new, params.dynamics_cov, sum_zpzpT, sum_zpxnT, sum_xnxnT, N_transitions)
+            f_cov = dynamics_objective(W_new, Q, sum_zpzpT, sum_zpxnT, sum_xnxnT, N_transitions)
+
+            jax.debug.print(
+                "f_old: {a:.4f}, f_weights: {b:.4f}, f_cov: {c:.4f}",
+                a=f_old, b=f_weights, c=f_cov,
+                ordered=True,
             )
 
         # logger.warning('Warning, fixing Q and R')
@@ -1277,13 +1355,13 @@ class CLDS2:
         # R = jnp.eye(self.emission_dim)
         params = ParamsCLDS2(
             initial_mean=m,
-            initial_cov=S,
+            initial_cov=utils.symmetrize(S),
             dynamics_weights=As,
             dynamics_bias=bs,
-            dynamics_cov=Q,
+            dynamics_cov=utils.symmetrize(Q),
             emissions_weights=Cs,
             emissions_bias=ds,
-            emissions_cov=R,
+            emissions_cov=utils.symmetrize(R),
         )
         return params
 
@@ -1370,9 +1448,9 @@ class CLDS2:
             batch_stats, lls = vmap(partial(self.e_step, params))(
                 emissions, conditions, mask
             )
-            log_priors = vmap(partial(self.log_prior, params))(conditions)
+            # log_priors = vmap(partial(self.log_prior, params))(conditions)
             mll = lls.sum()
-            lp = log_priors.sum() + mll
+            lp = mll + self.log_prior(params)
 
             # Update with M-step
             params = self.m_step(params, batch_stats)
@@ -1408,4 +1486,6 @@ class CLDS2:
             )
 
         self.params = params
-        return params, log_probs
+        return params, (marginal_log_liks, log_probs)
+
+# %%
