@@ -38,7 +38,7 @@ import clds.utils as utils
 
 # %%
 class WeightSpaceGaussianProcess:
-    """
+    r"""
     Weight-space Gaussian Process prior for matrix-valued random functions
         A_ij(u) = \sum_l w^{(ij)} \phi_l(u),       w^{(ij)} ~ N(0, 1)
     where w are the weights and \phi_l are the basis functions.
@@ -68,7 +68,7 @@ class WeightSpaceGaussianProcess:
         weights: Float[Array, "n_basis_funcs output_dim input_dim"],
         conditions: Float[Array, "n_steps n_conditions"],
     ) -> Float[Array, "n_steps output_dim input_dim"]:
-        """
+        r"""
         Evaluate A_ij(u) = \sum_l w^{(ij)} \phi_l(u) at the M-dimensional points u in `conditions`
         with `weights` w^{(ij)} and basis functions \phi_l.
         """
@@ -113,7 +113,7 @@ class WeightSpaceGaussianProcess:
 
 
 class WeightSpaceGaussianProcess2:
-    """
+    r"""
     Weight-space Gaussian Process prior for matrix-valued random functions
         A_ij(u) = \sum_l w^{(ij)} \phi_l(u),       w^{(ij)} ~ N(0, 1)
     where w are the weights and \phi_l are the basis functions.
@@ -148,7 +148,7 @@ class WeightSpaceGaussianProcess2:
         weights: Float[Array, "n_basis_funcs output_dim input_dim"],
         conditions: Float[Array, "n_steps n_conditions"],
     ) -> Float[Array, "n_steps output_dim input_dim"]:
-        """
+        r"""
         Evaluate A_ij(u) = \sum_l w^{(ij)} \phi_l(u) at the M-dimensional points u in `conditions`
         with `weights` w^{(ij)} and basis functions \phi_l.
         """
@@ -990,6 +990,21 @@ class CLDS2:
         smoothed_means, smoothed_covariances, smoothed_cross_covariances = (
             smoother_results
         )
+        b_ones = jnp.ones((inputs.shape[0], 1))
+        y = emissions
+
+        # zero out padded steps so they do not contribute to any stats;
+        # transition t -> t+1 is valid iff mask[t+1]
+        if mask is not None:
+            smoothed_means = jnp.where(mask[:, None], smoothed_means, 0.0)
+            smoothed_covariances = jnp.where(
+                mask[:, None, None], smoothed_covariances, 0.0
+            )
+            smoothed_cross_covariances = jnp.where(
+                mask[1:, None, None], smoothed_cross_covariances, 0.0
+            )
+            b_ones = jnp.where(mask[:, None], b_ones, 0.0)
+            y = jnp.where(mask[:, None], y, 0.0)
 
         # shorthand
         Ex = smoothed_means
@@ -999,16 +1014,12 @@ class CLDS2:
         Vxp = smoothed_covariances[:-1]
         Vxn = smoothed_covariances[1:]
         Expxn = smoothed_cross_covariances
-        b = jnp.ones((inputs.shape[0], 1))
-        y = emissions
         up = inputs[:-1]
 
         # mask shorthand if needed
         if mask is not None:
             Exp = jnp.where(mask[1:, None], Exp, 0.0)
             Vxp = jnp.where(mask[1:, None, None], Vxp, 0.0)
-            b = jnp.where(mask[:, None], b, 0.0)
-            y = jnp.where(mask[:, None], y, 0.0)
 
         ## expected sufficient statistics for the initial distribution
         Ex0 = smoothed_means[0]
@@ -1039,7 +1050,7 @@ class CLDS2:
         sum_xpxnT = Expxn.sum(0)
         sum_xnxnT = Vxn.sum(0) + Exn.T @ Exn
         if self.use_dynamics_bias:
-            bp = b[1:]
+            bp = b_ones[1:]
             sum_xpT = Exp.T @ bp
             sum_xpxpT = jnp.block([[sum_xpxpT, sum_xpT], [sum_xpT.T, bp.T @ bp]])
             sum_xpxnT = jnp.block([[Expxn.sum(0)], [bp.T @ Exn]])
@@ -1077,9 +1088,9 @@ class CLDS2:
         sum_xyT = Ex.T @ y
         sum_yyT = y.T @ y
         if self.use_emissions_bias:
-            sum_xT = Ex.T @ b
-            sum_xxT = jnp.block([[sum_xxT, sum_xT], [sum_xT.T, b.T @ b]])
-            sum_xyT = jnp.block([[sum_xyT], [b.T @ y]])
+            sum_xT = Ex.T @ b_ones
+            sum_xxT = jnp.block([[sum_xxT, sum_xT], [sum_xT.T, b_ones.T @ b_ones]])
+            sum_xyT = jnp.block([[sum_xyT], [b_ones.T @ y]])
         emission_stats = (sum_xxT, sum_xyT, sum_yyT, num_timesteps)
 
         # full E-step sufficient stats for emissions wGP
@@ -1235,7 +1246,7 @@ class CLDS2:
             Cs, ds, R = fit_linear_regression(*emission_stats, self.use_emissions_bias)
 
         # logger.warning('Warning, fixing Q and R')
-        Q = jnp.eye(self.state_dim)  # Can fix Q to be identity (for identifiability)
+        # Q = jnp.eye(self.state_dim)  # Can fix Q to be identity (for identifiability)
         # R = jnp.eye(self.emission_dim)
         params = ParamsCLDS2(
             initial_mean=m,

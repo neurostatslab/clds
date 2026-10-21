@@ -178,3 +178,7 @@ dependencies = [
 # If you are using a different build backend, you will need to change this.
 [tool.setuptools.packages.find]
 include = ["clds"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --import-mode=importlib"
