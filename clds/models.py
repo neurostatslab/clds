@@ -585,6 +585,9 @@ class CLDS2:
         whether to include a bias term in the dynamics, by default True.
     use_emissions_bias : bool, optional
         whether to include a bias term in the emissions, by default False.
+    fix_Q : bool, optional
+        whether to fix the dynamics covariance Q to the identity (for identifiability),
+        by default True. If False, Q is learned in the M-step.
     initial_params : Optional[ParamsCLDS2], optional
         initial parameters for the model, by default None.
     """
@@ -599,6 +602,7 @@ class CLDS2:
         use_initial_prior: bool = True,
         use_dynamics_bias: bool = True,
         use_emissions_bias: bool = False,
+        fix_Q: bool = True,
         initial_params: Optional[ParamsCLDS2] = None,
     ):
         # store parameters and flags
@@ -610,6 +614,7 @@ class CLDS2:
         self.use_emissions_prior = use_emissions_prior
         self.use_emissions_bias = use_emissions_bias
         self.use_initial_prior = use_initial_prior
+        self.fix_Q = fix_Q
 
         self.initial_params = initial_params
         self.params = None
@@ -704,7 +709,7 @@ class CLDS2:
             emissions_bias=emissions_bias,
             initial_mean=initial_mean,
             initial_cov=noise_scale**2 * jnp.eye(self.state_dim),
-            dynamics_cov=noise_scale**2 * jnp.eye(self.state_dim),
+            dynamics_cov=(1.0 if self.fix_Q else noise_scale**2) * jnp.eye(self.state_dim),
             emissions_cov=noise_scale**2 * jnp.eye(self.emission_dim),
         )
 
@@ -1138,7 +1143,7 @@ class CLDS2:
         batch_stats: Tuple,  # inputs: Optional[Float[Array, "num_timesteps input_dim"]]=None,
     ) -> ParamsCLDS:
         def fit_linear_regression(ExxT, ExyT, EyyT, N, use_bias):
-            # Solve a linear regression given sufficient statistics
+            '''Solve a linear regression given sufficient statistics'''
             W = utils.psd_solve(ExxT, ExyT).T
             Sigma = (EyyT - W @ ExyT - ExyT.T @ W.T + W @ ExxT @ W.T) / N
             if use_bias:
@@ -1148,23 +1153,37 @@ class CLDS2:
                 bias = None
             return W, bias, Sigma
 
-        def fit_gplinear_regression(ZTZ, ZTY, wgp_prior):
-            # Solve a linear regression in weight-space given sufficient statistics
+        def fit_gplinear_regression(ZTZ, ZTY, wgp_prior, use_bias):
+            r'''
+            Solve a linear regression in weight-space given sufficient statistics,
+            assuming identity noise covariance: the Sylvester equation
+            ZTZ W + W Sigma = ZTY reduces to (ZTZ + I) W = ZTY
+            '''
             weights = jax.scipy.linalg.solve(
-                ZTZ + jnp.eye(wgp_prior.n_basis_funcs * wgp_prior.input_dim),
+                ZTZ + jnp.eye(ZTZ.shape[0]),
                 ZTY,
                 assume_a="pos",
             )
+            if use_bias:
+                bias = weights[wgp_prior.n_basis_funcs * wgp_prior.input_dim :].reshape(
+                    wgp_prior.n_basis_funcs, wgp_prior.output_dim, 1
+                )
+                weights = weights[: wgp_prior.n_basis_funcs * wgp_prior.input_dim]
+            else:
+                bias = None
             weights = weights.reshape(
                 wgp_prior.n_basis_funcs, wgp_prior.input_dim, wgp_prior.output_dim
             ).transpose(0, 2, 1)
-            return weights
+            return weights, bias
 
         def fit_gplinear_regression_sylvester(
             ZTZ, ZTY, YTY, N, 
             Sigma, wgp_prior, use_bias
         ):
-            # Solve a linear regression in weight-space given sufficient statistics
+            r'''
+            Solve a linear regression in weight-space given sufficient statistics
+                ZTZ W + W Sigma = ZTY
+            '''
             # weights = utils.jax_solve_sylvester(B, ZTZ, ZTY, assume_a='pos')
             weights = utils.jax_solve_sylvester_BS(ZTZ, Sigma, ZTY)
             # weights = utils.solve_sylvester_symmetric(ZTZ, Sigma, ZTY)
@@ -1172,25 +1191,18 @@ class CLDS2:
             Sigma = (
                 YTY - weights.T @ ZTY - ZTY.T @ weights + weights.T @ ZTZ @ weights
             ) / N
+
             if use_bias:
                 bias = weights[wgp_prior.n_basis_funcs * wgp_prior.input_dim :].reshape(
                     wgp_prior.n_basis_funcs, wgp_prior.output_dim, 1
                 )
-                weights = (
-                    weights[: wgp_prior.n_basis_funcs * wgp_prior.input_dim]
-                    .reshape(
-                        wgp_prior.n_basis_funcs,
-                        wgp_prior.input_dim,
-                        wgp_prior.output_dim,
-                    )
-                    .transpose(0, 2, 1)
-                )
+                weights = weights[: wgp_prior.n_basis_funcs * wgp_prior.input_dim]
             else:
                 bias = None
-                weights = weights.reshape(
-                    wgp_prior.n_basis_funcs, wgp_prior.input_dim, wgp_prior.output_dim
-                ).transpose(0, 2, 1)
 
+            weights = weights.reshape(
+                wgp_prior.n_basis_funcs, wgp_prior.input_dim, wgp_prior.output_dim
+            ).transpose(0, 2, 1)
             return weights, bias, Sigma
     
         # Sum the statistics across all batches
@@ -1206,7 +1218,6 @@ class CLDS2:
 
         # Perform MLE estimation jointly
         if self.use_initial_prior:
-            # m = fit_gplinear_regression(*init_gp_stats, self.priors["init"])
             m, _, S = fit_gplinear_regression_sylvester(
                 *init_gp_stats, 
                 Sigma=params.initial_cov,
@@ -1219,7 +1230,13 @@ class CLDS2:
             S = sum_x0x0T / N0 - jnp.outer(m, m)
 
         # Dynamics M-step
-        if self.use_dynamics_prior:
+        if self.use_dynamics_prior and self.fix_Q:
+            As, bs = fit_gplinear_regression(
+                *dynamics_gp_stats[:2],
+                wgp_prior=self.priors["dynamics"],
+                use_bias=self.use_dynamics_bias,
+            )
+        elif self.use_dynamics_prior:
             As, bs, Q = fit_gplinear_regression_sylvester(
                 *dynamics_gp_stats,
                 Sigma=params.dynamics_cov,
@@ -1227,7 +1244,11 @@ class CLDS2:
                 use_bias=self.use_dynamics_bias,
             )
         else:
+            # MLE of A, b does not depend on Q
             As, bs, Q = fit_linear_regression(*dynamics_stats, self.use_dynamics_bias)
+
+        if self.fix_Q:
+            Q = jnp.eye(self.state_dim)
 
         # # Use the following for homogeneous bias
         # b = jnp.mean(bs, axis=0)
@@ -1245,9 +1266,6 @@ class CLDS2:
         else:
             Cs, ds, R = fit_linear_regression(*emission_stats, self.use_emissions_bias)
 
-        # logger.warning('Warning, fixing Q and R')
-        # Q = jnp.eye(self.state_dim)  # Can fix Q to be identity (for identifiability)
-        # R = jnp.eye(self.emission_dim)
         params = ParamsCLDS2(
             initial_mean=m,
             initial_cov=utils.symmetrize(S),
@@ -1327,12 +1345,15 @@ class CLDS2:
 
         if (self.initial_params is None) and (initial_params is None):
             # use default initialization if no initial params provided
-            initial_params = self.initialize_params(
-                jxr.PRNGKey(seed), emissions.shape[1]
-            )
+            initial_params = self.initialize_params(jxr.PRNGKey(seed))
         elif (self.initial_params is not None) and (initial_params is None):
             # use previously stored initial params if no initial params provided
             initial_params = self.initial_params
+
+        if self.fix_Q:
+            initial_params = initial_params._replace(
+                dynamics_cov=jnp.eye(self.state_dim)
+            )
 
         # overwrite initial params
         self.initial_params = initial_params

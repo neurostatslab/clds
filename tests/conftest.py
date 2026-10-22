@@ -4,8 +4,9 @@ import jax.numpy as jnp
 import jax
 import pytest
 
-@pytest.fixture(scope="module")
-def clds_case():
+@pytest.fixture(scope="module", params=[False, True], ids=["learn_Q", "fix_Q"])
+def clds_case(request):
+    fix_Q = request.param
     latent_dim = 2
     emission_dim = 3
     condition_dim = 1
@@ -24,6 +25,7 @@ def clds_case():
         use_emissions_prior=False,
         use_emissions_bias=False,
         use_initial_prior=True,
+        fix_Q=fix_Q,
         )
 
     # Define params
@@ -36,7 +38,7 @@ def clds_case():
         key=jax.random.key(0)
         )._replace( # use nonidentity to ensure no false-wins
             initial_cov=S0,
-            dynamics_cov=Q,
+            dynamics_cov=jnp.eye(latent_dim) if fix_Q else Q,
             # emissions_cov=noise_scale**2 * jnp.eye(emission_dim),
         )
 
@@ -44,5 +46,5 @@ def clds_case():
         "model": model,
         "params": params,
         "condition_dim": condition_dim,
-        "fixed_covariances": (), # or ("dynamics",) when Q is fixed
+        "fixed_covariances": ("dynamics",) if fix_Q else (),
     }
