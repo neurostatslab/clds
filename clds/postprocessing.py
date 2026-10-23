@@ -172,17 +172,22 @@ def compute_composite_dynamics(
     ROTATE=True,
     n_bins=20,
     pad=1.0,
+    x_lims=None,
+    y_lims=None
 ):
     # assert model.wgps['A'] and model.wgps['b'], 'A and b priors are required'
     assert model.state_dim == 2, "Only 2D latent space is supported"
 
     H, Hinv = identifiability_transform(params)
 
-    # Create grid around fixed points
-    fixed_points = get_fixed_points(model, params, conditions_range, ROTATE=ROTATE)
+    # Create grid around fixed points if lims are not provided
+    if x_lims is None or y_lims is None:
+        fixed_points = get_fixed_points(model, params, conditions_range, ROTATE=ROTATE)
 
-    x_lims = (jnp.amin(fixed_points[:, 0]) - pad, jnp.amax(fixed_points[:, 0]) + pad)
-    y_lims = (jnp.amin(fixed_points[:, 1]) - pad, jnp.amax(fixed_points[:, 1]) + pad)
+    if x_lims is None:
+        x_lims = (jnp.amin(fixed_points[:, 0]) - pad, jnp.amax(fixed_points[:, 0]) + pad)
+    if y_lims is None:
+        y_lims = (jnp.amin(fixed_points[:, 1]) - pad, jnp.amax(fixed_points[:, 1]) + pad)
 
     x_bin_edges = jnp.linspace(*x_lims, n_bins)
     y_bin_edges = jnp.linspace(*y_lims, n_bins)
