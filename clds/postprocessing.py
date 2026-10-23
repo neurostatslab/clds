@@ -5,10 +5,12 @@ Helper functions for postprocessing, given trained models
 import jax
 import jax.numpy as jnp
 from jaxtyping import Float, Array
+from typing import Tuple
+from functools import partial
 from scipy.stats import binned_statistic_2d
 from tqdm import tqdm
 
-from .models import ParamsCLDS, CLDS
+from .models import ParamsCLDS, CLDS, WeightSpaceGaussianProcess
 
 
 def identifiability_transform(params):
@@ -60,6 +62,104 @@ def get_fixed_points(
     #     fixed_points = model.fixed_point_func(conditions_range)
 
     return fixed_points
+
+def expected_latent_given_u(
+        model, params, emissions, conditions, basis = None, mask = None,
+    ) -> Tuple[WeightSpaceGaussianProcess, jnp.ndarray]:
+    '''
+    Return E[x | u] as a function of u, fit with GP prior
+    Samples {(u^i, x^i)} are obtained from posterior smoothing over batches,
+        xs correspond to posterior means at that condition.
+    mask: Float[Array, "B T"], optional, valid (padded) time steps are True (False)
+    '''
+    if basis is None:
+        basis = model.priors["dynamics"].basis
+
+    E_x_given_u = WeightSpaceGaussianProcess(
+                    basis=basis,
+                    output_dim=model.state_dim,
+                    )
+
+    if mask is None:
+        mask = jnp.ones(emissions.shape[:2], dtype=bool)
+    else:
+        # front load valid data, as in CLDS2.fit
+        mask = mask.astype(bool)
+        shift = jnp.argmax(mask, axis=1)
+        roll = jax.vmap(partial(jnp.roll, axis=0))
+        emissions, conditions, mask = (
+            roll(emissions, -shift), 
+            roll(conditions, -shift), 
+            roll(mask, -shift)
+        )
+
+    # Compute stats for E[x|u] fit, padded steps contribute zero
+    def smooth_and_basis(Y, U, valid):
+        _, _, (m, _, _) = model.smoother(params, emissions=Y, inputs=U, mask=valid)
+        PhiU = jnp.where(valid[:, None], E_x_given_u.evaluate_basis(U), 0.0)
+        return PhiU, m
+
+    Z, M = jax.vmap(smooth_and_basis)(emissions, conditions, mask) # (B, T, d), (B, T, k)
+    ZTZ = jnp.einsum('bti,btj->ij', Z, Z)
+    ZTY = jnp.einsum('bti,btk->ik', Z, M)
+
+    # Fit E[x|u] weights
+    weights = jax.scipy.linalg.solve(
+        ZTZ + jnp.eye(ZTZ.shape[0]),
+        ZTY,
+        assume_a="pos",
+        )
+    weights = weights[:, :, None] # n_basis_funcs output_dim input_dim
+
+    return E_x_given_u, weights
+
+def get_regularized_fixed_points(
+        model, params, emissions, conditions, conditions_range, ROTATE=False, tau=0.1, mask=None,
+    ) -> tuple:
+    """
+    Compute fixed points of the system regularized (Tikhonov, Ridge) by their distances to anchors E[x|u],
+        x^*(u) = argmin_x [ ||x - A(u)x - b(u)||^2 + tau^2 * ||x - E[x|u]||^2 ]
+
+    given parameters evaluated over condition range.
+    Args:
+        params: ParamsCLDS2, the parameters of the model
+        conditions_range: Float[Array, "T M"], the range of conditions to evaluate the fixed points
+        ROTATE: bool, whether to rotate the latent space (chosen so that Q becomes identity)
+        mask: Float[Array, "B T"], optional, mask of valid time steps for the E[x|u] fit
+    """
+    def regularized_point(A, b, anchor):
+        """A: (D,D), b and anchor: (D,)."""
+        M = jnp.eye(A.shape[-1], dtype=A.dtype) - A
+        U, s, Vh = jnp.linalg.svd(M, full_matrices=False)
+
+        rhs = b - M @ anchor
+        gains = s / (s**2 + tau**2)
+        x = anchor + Vh.T @ (gains * (U.T @ rhs))
+
+        drift = A @ x + b - x
+        return x, jnp.linalg.norm(drift), s.min()
+
+    assert model.use_dynamics_prior, "Fixed points are not a function of 'u'"
+    As, _, bs, _, _ = model.weights_to_params(
+        params, conditions_range
+    )
+    if ROTATE:
+        H, Hinv = identifiability_transform(params)
+        As = jnp.einsum("ij,tjk,kl->til", H, As, Hinv)
+        bs = jnp.einsum("ij,tj->ti", H, bs)
+
+    # Fit and compute E[x|u] over range
+    E_x_given_u, weights = expected_latent_given_u(
+        model, params, emissions, conditions, mask=mask,
+    )
+    anchors = E_x_given_u(weights, conditions_range)[..., 0]
+    if ROTATE:
+        anchors = anchors @ H.T
+
+    # Compute regularized fixed points
+    regularized_points, _, _ = jax.vmap(regularized_point)(As, bs, anchors)
+
+    return regularized_points, anchors
 
 
 # %%
