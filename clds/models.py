@@ -1017,11 +1017,12 @@ class CLDS2:
         ExxT = Vx + jnp.einsum("ti,tj->tij", Ex, Ex)
 
         ## initial state: x[0] = m(u[0]) + noise
+        # slice with [:1] to keep the leading time axis (a single step) expected by regression_stats
         ZTZ, ZTY = regression_stats(
-            Phi_x=None, 
-            Phi_1=features("m", inputs[0]), 
-            Ey=Ex[0]
-            )
+            Phi_x=None,
+            Phi_1=features("m", inputs[:1]),
+            Ey=Ex[:1],
+        )
         init_stats = (ZTZ, ZTY, ExxT[0], 1)
 
         ## dynamics: x[t+1] = A(u[t]) x[t] + b(u[t]) + noise, for t = 0...T-2

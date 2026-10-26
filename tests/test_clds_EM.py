@@ -34,10 +34,10 @@ BLOCKS = {
     "emissions": ("emissions_weights", "emissions_bias", "emissions_cov"),
     "initial": ("initial_mean", "initial_cov"),
 }
-FLAGS = {
-    "dynamics": "use_dynamics_prior",
-    "emissions": "use_emissions_prior",
-    "initial": "use_initial_prior",
+COEFS = {  # (coefficient on x, bias) of each block
+    "dynamics": ("A", "b"),
+    "emissions": ("C", "d"),
+    "initial": (None, "m"),
 }
 
 
@@ -223,7 +223,7 @@ def fitting_case(clds_case):
     fixed = frozenset(clds_case.get("fixed_covariances", ()))
     assert fixed <= BLOCKS.keys(), "fixed_covariances must name parameter blocks"
     assert D >= 2 and E >= 2, "Use at least two dimensions to exercise matrix/bias layout"
-    assert model.use_dynamics_prior and model.use_initial_prior, (
+    assert {"A", "m"} <= model.gp_priors, (
         "Enable dynamics and initial GP priors to cover the regressions we diagnosed"
     )
     assert model.use_dynamics_bias, "Enable dynamics bias to test the joint A,b blocks"
@@ -242,7 +242,7 @@ def fitting_case(clds_case):
     B, T, M = 3, 8, clds_case.get("condition_dim", 1)
     u = rng.uniform(-1.1, 1.1, size=(B, T, M))
     y = rng.normal(size=(B, T, E)) + 0.25 * np.sin(np.arange(T))[None, :, None]
-    for block, prior_name in (("dynamics", "dynamics"), ("initial", "init")):
+    for block, prior_name in (("dynamics", "A"), ("initial", "m")):
         phi = np.asarray(model.priors[prior_name].evaluate_basis(jnp.asarray(u[0])))
         assert phi.shape[1] >= 2 and not np.allclose(phi[1:], phi[:-1]), (
             f"Use a varying {block} basis; constant conditions hide indexing bugs"
@@ -318,44 +318,34 @@ def _regression(model, stats, block):
     All statistics are expectations under the fixed E-step posterior.
     
     To make clear the notation, these stats are used to update [W, Σ] with:
-        (1) ZTZ W + W Σ = ZTY (solving gives W_new,  +WΣ is due to the N(0,1) prior on W)
+        (1) ZTZ W + Λ W Σ = ZTY (solving gives W_new, +ΛWΣ is due to the N(0,1) prior
+            on the rows of W with a GP prior, Λ = diag(has_prior))
         (2) Σ_new = (YTY - W_new.T @ ZTY - ZTY.T @ W_new + W_new.T @ ZTZ @ W_new) / N
     """
-    if block == "initial":
-        if model.use_initial_prior:
-            # (ZTZ_m0, ZTY_m0, Ex0x0T, N0)
-            return stats[1]
-
-        sum_x0, YTY, N = stats[0]
-        ZTZ = jnp.asarray(N).reshape(1, 1)
-        ZTY = sum_x0[None, :]
-    else:
-        static_index, gp_index = {
-            "dynamics": (2, 3),
-            "emissions": (4, 5),
-        }[block]
-
-        index = gp_index if getattr(model, FLAGS[block]) else static_index
-        ZTZ, ZTY, YTY, N = stats[index]
-    return ZTZ, ZTY, YTY, N
+    return stats[block]
 
 
 def _pack(model, params, block):
-    '''Concatenate [W_A, W_b] if needed'''
+    '''Concatenate [W_A, W_b] if needed, and flag the rows with a N(0,1) prior'''
+    linear_coef, bias_coef = COEFS[block]
+    weights, labels = [], []
     if block == "initial":
         m = params.initial_mean
-        return m[..., 0] if model.use_initial_prior else m.reshape(1, -1)
-    weight_name, bias_name, _ = BLOCKS[block]
-    w, bias = getattr(params, weight_name), getattr(params, bias_name)
-    if not getattr(model, f"use_{block}_bias"):
-        bias = None
-    if getattr(model, FLAGS[block]):
-        W = w.transpose(0, 2, 1).reshape(-1, w.shape[1])
-        b = None if bias is None else bias[..., 0]
+        weights.append(m[..., 0] if "m" in model.gp_priors else m.reshape(1, -1))
+        labels.append("m")
     else:
-        W = w.T
-        b = None if bias is None else bias.reshape(1, -1)
-    return W if b is None else jnp.concatenate((W, b), axis=0)
+        weight_name, bias_name, _ = BLOCKS[block]
+        w, bias = getattr(params, weight_name), getattr(params, bias_name)
+        W = w.transpose(0, 2, 1).reshape(-1, w.shape[1]) if linear_coef in model.gp_priors else w.T
+        weights.append(W)
+        labels.append(linear_coef)
+        if getattr(model, f"use_{block}_bias"):
+            b = bias[..., 0] if bias_coef in model.gp_priors else bias.reshape(1, -1)
+            weights.append(b)
+            labels.append(bias_coef)
+    W = jnp.concatenate(weights, axis=0)
+    has_prior = jnp.concatenate([jnp.full(len(p), c in model.gp_priors) for p, c in zip(weights, labels)])
+    return W, has_prior
 
 
 def _regression_terms(fitting_case, params, stats, block):
@@ -367,7 +357,7 @@ def _regression_terms(fitting_case, params, stats, block):
     """
     ZTZ, ZTY, YTY, N = _regression(fitting_case.model, stats, block)
     
-    W = _pack(fitting_case.model, params, block)
+    W, has_prior = _pack(fitting_case.model, params, block)
     cov = getattr(params, BLOCKS[block][-1])
     L = jnp.linalg.cholesky(cov)
 
@@ -375,7 +365,7 @@ def _regression_terms(fitting_case, params, stats, block):
     residual_second_moment = YTY - W.T @ ZTY - ZTY.T @ W + W.T @ ZTZ @ W
     expected_loglik = -0.5 * (2 * N * jnp.log(jnp.diag(L)).sum()
                  + jnp.trace(jnp.linalg.solve(cov, residual_second_moment)))
-    log_prior = -0.5 * jnp.sum(W ** 2) if getattr(fitting_case.model, FLAGS[block]) else jnp.asarray(0.0)
+    log_prior = -0.5 * jnp.sum(has_prior[:, None] * W ** 2)
     return jnp.stack((expected_loglik, log_prior))
 
 
@@ -394,40 +384,45 @@ def test_model_smoother_matches_source_time_dense_reference(fitting_case, step):
             _close(actual, expected, "Model wrapper posterior moments")
 
 
-def _design(phi, mean, with_bias):
+def _design(phi_x, phi_1, mean):
     """
     Important for the [weight, bias] combinations.
-    Explicit z=[phi kron x; phi]; ordering is (basis, state)."""
-    J = np.kron(np.asarray(phi)[:, None], np.eye(len(mean)))
+    Explicit z=[phi_x kron x; phi_1]; ordering is (basis, state). phi_1 is None without bias."""
+    J = np.kron(np.asarray(phi_x)[:, None], np.eye(len(mean)))
     z = J @ mean
-    if with_bias:
-        z = np.concatenate((z, phi))
-        J = np.vstack((J, np.zeros((len(phi), len(mean)))))
+    if phi_1 is not None:
+        z = np.concatenate((z, phi_1))
+        J = np.vstack((J, np.zeros((len(phi_1), len(mean)))))
     return z, J
 
 
 def _reference_stats(fitting_case, params, block):
     """Build ZTZ, ZTY, YTY, N with explicit per-time features and dense posteriors."""
     model = fitting_case.model
+    linear_coef, bias_coef = COEFS[block]
+
+    def basis(c, u):
+        """GP basis of coefficient c, or the constant basis [1] for a static coefficient."""
+        return (np.asarray(model.priors[c].evaluate_basis(u))
+                if c in model.gp_priors else np.ones((len(u), 1)))
+
     result = None
     for trial in range(len(fitting_case.y)):
         _, (mu, cov, cross) = _dense_posterior(**_evaluated(fitting_case, params, trial))
         y, u = np.asarray(fitting_case.y[trial]), fitting_case.u[trial]
         T, D = mu.shape
         if block == "initial":
-            phi = (np.asarray(model.priors["init"].evaluate_basis(u[:1]))[0]
-                   if model.use_initial_prior else np.ones(1))
+            phi = basis("m", u[:1])[0]
             terms = [(np.outer(phi, phi), np.outer(phi, mu[0]),
                       cov[0] + np.outer(mu[0], mu[0]), 1)]
         else:
             is_dyn = block == "dynamics"
             n = T - 1 if is_dyn else T
-            phi = (np.asarray(model.priors[block].evaluate_basis(u[:n]))
-                   if getattr(model, FLAGS[block]) else np.ones((n, 1)))
-            with_bias = getattr(model, f"use_{block}_bias")
+            phi_x = basis(linear_coef, u[:n])
+            phi_1 = basis(bias_coef, u[:n]) if getattr(model, f"use_{block}_bias") else None
             terms = []
             for t in range(n):
-                z, J = _design(phi[t], mu[t], with_bias)
+                z, J = _design(phi_x[t], None if phi_1 is None else phi_1[t], mu[t])
                 ZTZ = np.outer(z, z) + J @ cov[t] @ J.T
                 if is_dyn:
                     lag_cov = cross[t] - np.outer(mu[t], mu[t + 1])
@@ -481,12 +476,10 @@ def test_likelihood_and_prior_scores_match_fixed_moments(fitting_case, step, blo
 @pytest.mark.parametrize("block", BLOCKS)
 def test_m_step_normal_equation_and_covariance(fitting_case, step, block):
     ZTZ, ZTY, YTY, N = _regression(fitting_case.model, step.stats, block)
-    W = _pack(fitting_case.model, step.new, block)
+    W, has_prior = _pack(fitting_case.model, step.new, block)
     old_cov = getattr(step.old, BLOCKS[block][-1])
     new_cov = getattr(step.new, BLOCKS[block][-1])
-    lhs = ZTZ @ W
-    if getattr(fitting_case.model, FLAGS[block]):
-        lhs = lhs + W @ old_cov
+    lhs = ZTZ @ W + has_prior[:, None] * (W @ old_cov)
     _close(lhs, ZTY, f"{block} normal equation: use OLD covariance, not batch-summed covariance")
     _close(new_cov, new_cov.T, f"{block} covariance symmetry")
     assert np.linalg.eigvalsh(np.asarray(new_cov)).min() > 0, f"{block} covariance is not PD"
