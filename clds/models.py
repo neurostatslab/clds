@@ -9,7 +9,8 @@ import jax.numpy as jnp
 import jax.random as jxr
 
 from jaxtyping import Array, Float
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, Dict, Iterable
+import warnings
 
 from .utils import logprob_analytic
 from functools import partial
@@ -562,10 +563,14 @@ class CLDS:
 # %%
 class CLDS2:
     """
-    Conditionally Linear Dynamical System (CLDS) model, with LDS dynamics and
-    weight-space view parametrization of the GP priors for the parameters {A, b, C, d, m0}.
+    Conditionally Linear Dynamical System (CLDS) model, with LDS dynamics
+        x_0     ~ N(m(u_0), S0)
+        x_{t+1} = A(u_t) x_t + b(u_t) + N(0, Q)
+        y_t     = C(u_t) x_t + d(u_t) + N(0, R)
+    and weight-space view parametrization of the GP priors for the coefficients {A, b, C, d, m}.
 
-    If weight-space GP priors are not specified for any parameter, it is learned as a static parameter.
+    Each coefficient listed in `gp_priors` has a weight-space GP prior; all others are
+    learned as static parameters.
 
     Parameters
     ----------
@@ -575,46 +580,64 @@ class CLDS2:
         dimension of the observation space.
     basis : list
         list of basis functions for the weight-space GP priors.
-    use_dynamics_prior : bool, optional
-        whether to use a GP prior for the dynamics matrix A, by default True.
-    use_emissions_prior : bool, optional
-        whether to use a GP prior for the emissions matrix C, by default True.
-    use_initial_prior : bool, optional
-        whether to use a GP prior for the initial state mean m0, by default True.
+    gp_priors : Iterable[str], optional
+        - coefficients among {"A", "b", "C", "d", "m"} with a weight-space GP prior, 
+            e.g. ["b"] for x_{t+1} = A x_t + b(u_t), y_t = C x_t + d. 
+        - "b" (resp. "d") requires use_dynamics_bias (resp. use_emissions_bias). 
+        - By default (None), every coefficient of the model has a GP prior.
     use_dynamics_bias : bool, optional
-        whether to include a bias term in the dynamics, by default True.
+        whether to include a bias term b in the dynamics, by default True.
     use_emissions_bias : bool, optional
-        whether to include a bias term in the emissions, by default False.
+        whether to include a bias term d in the emissions, by default False.
     fix_Q : bool, optional
         whether to fix the dynamics covariance Q to the identity (for identifiability),
         by default True. If False, Q is learned in the M-step.
     initial_params : Optional[ParamsCLDS2], optional
         initial parameters for the model, by default None.
+    use_dynamics_prior, use_emissions_prior, use_initial_prior : bool, optional
+        deprecated, use `gp_priors` instead. Each flag puts a GP prior on (A, b), (C, d)
+        and m respectively, and defaults to True when any of them is given.
     """
+
+    # coefficient -> field of ParamsCLDS2
+    COEFFICIENTS = {
+        "A": "dynamics_weights",
+        "b": "dynamics_bias",
+        "C": "emissions_weights",
+        "d": "emissions_bias",
+        "m": "initial_mean",
+    }
+    # (coefficient on x, bias) of each regression block solved in the M-step
+    BLOCKS = {
+        "initial": (None, "m"),
+        "dynamics": ("A", "b"),
+        "emissions": ("C", "d"),
+    }
 
     def __init__(
         self,
         state_dim: int,
         emission_dim: int,
         basis: list,  # soon to be class
-        use_dynamics_prior: bool = True,
-        use_emissions_prior: bool = True,
-        use_initial_prior: bool = True,
+        gp_priors: Optional[Iterable[str]] = None,
         use_dynamics_bias: bool = True,
         use_emissions_bias: bool = False,
         fix_Q: bool = True,
         initial_params: Optional[ParamsCLDS2] = None,
+        use_dynamics_prior: Optional[bool] = None,  #! depracated
+        use_emissions_prior: Optional[bool] = None, #! depracated
+        use_initial_prior: Optional[bool] = None,   #! depracated
     ):
         # store parameters and flags
         self.state_dim = state_dim
         self.emission_dim = emission_dim
 
-        self.use_dynamics_prior = use_dynamics_prior
         self.use_dynamics_bias = use_dynamics_bias
-        self.use_emissions_prior = use_emissions_prior
         self.use_emissions_bias = use_emissions_bias
-        self.use_initial_prior = use_initial_prior
         self.fix_Q = fix_Q
+        self.gp_priors = self._resolve_gp_priors(
+            gp_priors, use_dynamics_prior, use_emissions_prior, use_initial_prior
+        )
 
         self.initial_params = initial_params
         self.params = None
@@ -622,92 +645,114 @@ class CLDS2:
         # initialize priors
         self.priors = self.initialize_priors(basis)
 
+    def _equations(self) -> str:
+        def coef(c, t="t"):
+            return f"{c}(u_{t})" if c in self.gp_priors else c
+
+        dynamics = f"{coef('A')} x_t" + (f" + {coef('b')}" if self.use_dynamics_bias else "")
+        emissions = f"{coef('C')} x_t" + (f" + {coef('d')}" if self.use_emissions_bias else "")
+        Q = "I" if self.fix_Q else "Q"
+        return (
+            f"CLDS2(state_dim={self.state_dim}, emission_dim={self.emission_dim})\n"
+            f"  x_0     ~ N({coef('m', 0)}, S0)\n"
+            f"  x_(t+1) = {dynamics} + N(0, {Q})\n"
+            f"  y_t     = {emissions} + N(0, R)"
+        )
+
+
+    def _resolve_gp_priors(
+        self, gp_priors, use_dynamics_prior, use_emissions_prior, use_initial_prior
+    ) -> frozenset:
+        """Validate `gp_priors`, or translate the deprecated use_*_prior flags into it."""
+        legacy = (use_dynamics_prior, use_emissions_prior, use_initial_prior)
+        if any(flag is not None for flag in legacy):
+            if gp_priors is not None:
+                raise ValueError(
+                    "Pass either gp_priors or the deprecated use_*_prior flags, not both."
+                )
+            warnings.warn(
+                "use_dynamics_prior, use_emissions_prior and use_initial_prior are "
+                "deprecated, pass gp_priors instead.",
+                DeprecationWarning,
+                stacklevel=3,
+            )
+            # unspecified flags keep their former default (True)
+            flags = dict(zip("ACm", (flag is None or flag for flag in legacy)))
+            flags["b"], flags["d"] = flags["A"], flags["C"]
+            gp_priors = [c for c, flag in flags.items() if flag and self._has(c)]
+        elif gp_priors is None:
+            warnings.warn(
+                "Neither `gp_priors` provided nor deprecated `use_*_prior` flags: "
+                "setting all requested coefficients to have GP prior."
+            )
+            gp_priors = [c for c in self.COEFFICIENTS if self._has(c)]
+
+        gp_priors = frozenset(gp_priors)
+        unknown = gp_priors - self.COEFFICIENTS.keys()
+        if unknown:
+            raise ValueError(
+                f"Unknown coefficients {sorted(unknown)} in gp_priors, "
+                f"expected a subset of {list(self.COEFFICIENTS)}."
+            )
+        disabled = sorted(c for c in gp_priors if not self._has(c))
+        if disabled:
+            raise ValueError(
+                f"gp_priors contains the biases {disabled}, which are disabled; "
+                "set use_dynamics_bias / use_emissions_bias."
+            )
+        return gp_priors
+
+    def _has(self, c) -> bool:
+        """Whether coefficient c is part of the model (the biases are optional)."""
+        return {"b": self.use_dynamics_bias, "d": self.use_emissions_bias}.get(
+            c, c is not None
+        )
+
+    def _coef_shape(self, c) -> tuple:
+        """Shape of coefficient c at a single time step."""
+        D, N = self.state_dim, self.emission_dim
+        return {"A": (D, D), "b": (D,), "C": (N, D), "d": (N,), "m": (D,)}[c]
+
+    def _n_basis(self, c) -> int:
+        """Number of basis functions of coefficient c (a static one has the basis [1])."""
+        return self.priors[c].n_basis_funcs if c in self.gp_priors else 1
+
+    def _basis(self, c, u):
+        """Basis Phi_c(u) of coefficient c at conditions u, [1] for a static coefficient."""
+        if c in self.gp_priors:
+            return self.priors[c].evaluate_basis(u)
+        return jnp.ones((u.shape[0], 1))
+
     def initialize_priors(self, basis: list):
-        """Initialize the priors based on the flags"""
-        priors = {
-            "dynamics": None,
-            "emissions": None,
-            "init": None,
-        }
-        if self.use_dynamics_prior:
-            priors["dynamics"] = WeightSpaceGaussianProcess(
+        """Initialize a weight-space GP prior for each coefficient in `gp_priors`"""
+        priors = dict.fromkeys(self.COEFFICIENTS)
+        for c in self.gp_priors:
+            output_dim, *input_dim = self._coef_shape(c)
+            priors[c] = WeightSpaceGaussianProcess(
                 basis=basis,
-                input_dim=self.state_dim,
-                output_dim=self.state_dim,
-                include_bias=self.use_dynamics_bias,
-            )
-        if self.use_emissions_prior:
-            priors["emissions"] = WeightSpaceGaussianProcess(
-                basis=basis,
-                input_dim=self.state_dim,
-                output_dim=self.emission_dim,
-                include_bias=self.use_emissions_bias,
-            )
-        if self.use_initial_prior:
-            priors["init"] = WeightSpaceGaussianProcess(
-                basis=basis,
-                input_dim=1,
-                output_dim=self.state_dim,
-                include_bias=False,
+                input_dim=input_dim[0] if input_dim else 1,
+                output_dim=output_dim,
             )
         return priors
 
     def initialize_params(self, key: jxr.PRNGKey, noise_scale: float = 1.0):
         """
         Initialize the model parameters based on the priors and flags.
-        If priors are used, GP weights are sampled from the priors.
-        If priors are not used, static parameters are randomly initialized.
+        GP weights are sampled from the priors, static coefficients are randomly
+        initialized, and disabled biases are set to zero.
         """
-        Ab_key, Cd_key, m0_key = jxr.split(key, 3)
+        keys = dict(zip(self.COEFFICIENTS, jxr.split(key, len(self.COEFFICIENTS))))
 
-        def get_params(key, use_prior, prior, input_dim, output_dim, use_bias):
-            if use_prior:
-                weights = prior.sample_weights(key)
-                if use_bias:
-                    bias = weights[:, :, -1:]
-                    weights = weights[:, :, :-1]
-                else:
-                    bias = jnp.zeros(output_dim)
-            else:
-                weights = jxr.normal(key, (output_dim, input_dim))
-                bias = (
-                    jxr.normal(key, (output_dim)) if use_bias else jnp.zeros(output_dim)
-                )
-            return weights, bias
-
-        # initialize dynamics
-        dynamics_weights, dynamics_bias = get_params(
-            Ab_key,
-            self.use_dynamics_prior,
-            self.priors["dynamics"],
-            self.state_dim,
-            self.state_dim,
-            self.use_dynamics_bias,
-        )
-
-        # initialize emissions
-        emissions_weights, emissions_bias = get_params(
-            Cd_key,
-            self.use_emissions_prior,
-            self.priors["emissions"],
-            self.state_dim,
-            self.emission_dim,
-            self.use_emissions_bias,
-        )
-
-        # initialize initial state
-        if self.use_initial_prior:
-            initial_mean = self.priors["init"].sample_weights(m0_key)
-        else:
-            initial_mean = jxr.normal(m0_key, self.state_dim)
+        def init(c):
+            if c in self.gp_priors:
+                return self.priors[c].sample_weights(keys[c])
+            if self._has(c):
+                return jxr.normal(keys[c], self._coef_shape(c))
+            return jnp.zeros(self._coef_shape(c))
 
         # pack together
         return ParamsCLDS2(
-            dynamics_weights=dynamics_weights,
-            dynamics_bias=dynamics_bias,
-            emissions_weights=emissions_weights,
-            emissions_bias=emissions_bias,
-            initial_mean=initial_mean,
+            **{field: init(c) for c, field in self.COEFFICIENTS.items()},
             initial_cov=noise_scale**2 * jnp.eye(self.state_dim),
             dynamics_cov=(1.0 if self.fix_Q else noise_scale**2) * jnp.eye(self.state_dim),
             emissions_cov=noise_scale**2 * jnp.eye(self.emission_dim),
@@ -815,83 +860,34 @@ class CLDS2:
         )
 
     def log_prior(self, params: ParamsCLDS2):
-        """Compute the log prior of the parameters."""
-
-        def get_log_prior(use_prior, prior, weights, bias, use_bias):
-            if use_prior:
-                return prior.log_prob_weights(weights) + (
-                    prior.log_prob_weights(bias) if use_bias else 0.0
-                )
-            else:
-                return 0.0
-
-        logprior_Ab = get_log_prior(
-            self.use_dynamics_prior,
-            self.priors["dynamics"],
-            params.dynamics_weights,
-            params.dynamics_bias,
-            self.use_dynamics_bias,
+        """Compute the log prior of the parameters (static coefficients have a flat prior)."""
+        return sum(
+            (
+                self.priors[c].log_prob_weights(getattr(params, field))
+                for c, field in self.COEFFICIENTS.items()
+                if c in self.gp_priors
+            ),
+            start=0.0,
         )
-        logprior_Cd = get_log_prior(
-            self.use_emissions_prior,
-            self.priors["emissions"],
-            params.emissions_weights,
-            params.emissions_bias,
-            self.use_emissions_bias,
-        )
-
-        if self.use_initial_prior:
-            logprior_m0 = self.priors["init"].log_prob_weights(params.initial_mean)
-        else:
-            logprior_m0 = 0.0
-
-        return logprior_Ab + logprior_Cd + logprior_m0
 
     def weights_to_params(self, params, inputs):
-        """Transform weights of weight space into parameters.
-        Implement as needed for all weight-space GP priors."""
+        """Evaluate the coefficients at the conditions `inputs`: GP coefficients through
+        their weight-space prior, static ones broadcast over time, disabled biases as zeros."""
 
-        def get_params(use_prior, prior, weights, bias, inputs, use_bias):
-            if use_prior:
-                A = prior(weights, inputs)
-                b = (
-                    prior(bias, inputs)
-                    if use_bias
-                    else jnp.zeros((inputs.shape[0], A.shape[1]))
-                )
-            else:
-                A = weights
-                if A.ndim == 2:
-                    A = jnp.tile(A[None], (len(inputs), 1, 1))
-                b = bias if use_bias else jnp.zeros((inputs.shape[0], A.shape[1]))
-                if b.shape[0] != len(inputs):
-                    b = jnp.tile(b, (len(inputs), 1, 1))
-            return A, b
+        def evaluate(c, u):
+            shape = (u.shape[0],) + self._coef_shape(c)
+            w = getattr(params, self.COEFFICIENTS[c])
+            if not self._has(c):
+                return jnp.zeros(shape)
+            if c in self.gp_priors:
+                return self.priors[c](w, u).reshape(shape) # replaces squeeze() for {b, d, m}
+            # Handle remaining static by broadcasting over time
+            return jnp.broadcast_to(jnp.reshape(w, (-1,) + shape[1:]), shape)
 
-        As, bs = get_params(
-            self.use_dynamics_prior,
-            self.priors["dynamics"],
-            params.dynamics_weights,
-            params.dynamics_bias,
-            inputs,
-            self.use_dynamics_bias,
-        )
-
-        Cs, ds = get_params(
-            self.use_emissions_prior,
-            self.priors["emissions"],
-            params.emissions_weights,
-            params.emissions_bias,
-            inputs,
-            self.use_emissions_bias,
-        )
-
-        m0 = (
-            self.priors["init"](params.initial_mean, inputs)[0]
-            if self.use_initial_prior
-            else params.initial_mean
-        )  #! Some unnecessary computation, keeping only t=0
-        return As, Cs, bs.squeeze(), ds.squeeze(), m0.squeeze()
+        As, bs = evaluate("A", inputs), evaluate("b", inputs)
+        Cs, ds = evaluate("C", inputs), evaluate("d", inputs)
+        m0 = evaluate("m", inputs[:1])[0]
+        return As, Cs, bs, ds, m0
 
     def smoother(self, params: ParamsCLDS, emissions, inputs, mask=None):
         """inputs as conditions"""
@@ -950,352 +946,231 @@ class CLDS2:
         inputs: Optional[Float[Array, "num_timesteps input_dim"]] = None,
         mask: Optional[Float[Array, "num_timesteps"]] = None,
     ):
-        def weightspace_stats(
-            Phi: Float[Array, "n_steps n_basis_funcs"],
-            XTX: Float[Array, "n_steps input_dim input_dim"] = None,
-            XTY: Float[Array, "n_steps input_dim output_dim"] = None,
+        """
+        Compute the expected sufficient statistics (ZTZ, ZTY, YTY, N) of the "initial",
+        "dynamics" and "emissions" regression blocks under the smoothing posterior.
+        Each block regresses its target on the features z_t = [Phi_x(u_t) kron x_t ; Phi_1(u_t)],
+        where Phi_x and Phi_1 are the bases of the coefficient on x and of the bias
+        (the constant [1] for a static coefficient), evaluated at the conditions u_t = inputs[t].
+        """
+
+        def regression_stats(
+            Phi_x: Optional[Float[Array, "n_steps n_basis_x"]],
+            Phi_1: Optional[Float[Array, "n_steps n_basis_1"]],
+            ExxT: Float[Array, "n_steps input_dim input_dim"] = None,
+            Ex: Float[Array, "n_steps input_dim"] = None,
+            ExyT: Float[Array, "n_steps input_dim output_dim"] = None,
+            Ey: Float[Array, "n_steps output_dim"] = None,
         ) -> tuple:
             """
-            Compute the expected sufficient statistics for the weight-space GP prior.
-            Provide the sufficient stats X^T X and X^T Y for the problem Y = A(C)X + noise.
-            This returns the expanded stats Phi @ X^T X @ Phi^T and Phi @ X^T Y for the basis functions Phi(C).
+            Compute the expected sufficient statistics Z^T Z and Z^T Y of the regression
+            y_t = W^T z_t + noise, with features z_t = [Phi_x(u_t) kron x_t ; Phi_1(u_t)]
+            ordered as (basis, state). A term is dropped when its basis is None.
             """
-            n_basis_funcs = Phi.shape[-1]
-
-            if XTX is not None:
-                input_dim = XTX.shape[-1]
-                ZTZ = jnp.einsum("tk,tl,tij->kilj", Phi, Phi, XTX).reshape(
-                    -1,
-                    n_basis_funcs * input_dim,
+            ZTZ, ZTY = [], []
+            if Phi_x is not None:
+                n_x = Phi_x.shape[1] * ExxT.shape[-1]
+                ZTZ.append(
+                    [jnp.einsum("tk,tl,tij->kilj", Phi_x, Phi_x, ExxT).reshape(n_x, n_x)]
                 )
-            else:
-                ZTZ = None
+                ZTY.append(jnp.einsum("tk,tim->kim", Phi_x, ExyT).reshape(n_x, -1))
+            if Phi_1 is not None:
+                ZTZ_11 = Phi_1.T @ Phi_1
+                if Phi_x is not None:
+                    ZTZ_x1 = jnp.einsum("tk,tl,ti->kil", Phi_x, Phi_1, Ex).reshape(n_x, -1)
+                    ZTZ[0].append(ZTZ_x1)
+                    ZTZ.append([ZTZ_x1.T, ZTZ_11])
+                else:
+                    ZTZ.append([ZTZ_11])
+                ZTY.append(Phi_1.T @ Ey)
+            return jnp.block(ZTZ), jnp.concatenate(ZTY, axis=0)
 
-            if XTY is not None:
-                output_dim = XTY.shape[-1]
-                ZTY = jnp.einsum("tk,tim->kim", Phi, XTY).reshape(-1, output_dim)
-            else:
-                ZTY = None
+        def features(c, u, valid=None):
+            """Basis of coefficient c at conditions u, zeroed at invalid steps (None if disabled)."""
+            if not self._has(c):
+                return None
+            Phi = self._basis(c, u)
+            return Phi if valid is None else jnp.where(valid[:, None], Phi, 0.0)
 
-            return ZTZ, ZTY
-
-        """take inputs to be theta"""
         if mask is not None:
             num_timesteps = mask.sum().astype(int)
         else:
             num_timesteps = emissions.shape[0]
 
         if inputs is None:
-            inputs = jnp.zeros((num_timesteps, 1))
+            inputs = jnp.zeros((emissions.shape[0], 1))
 
         # Run the smoother to get posterior expectations
-        marginal_loglik, filter_results, smoother_results = self.smoother(
+        marginal_loglik, _, smoother_results = self.smoother(
             params, emissions, inputs, mask
         )
-        smoothed_means, smoothed_covariances, smoothed_cross_covariances = (
-            smoother_results
-        )
-        b_ones = jnp.ones((inputs.shape[0], 1))
+        Ex, Vx, Expxn = smoother_results
         y = emissions
 
         # zero out padded steps so they do not contribute to any stats;
         # transition t -> t+1 is valid iff mask[t+1]
         if mask is not None:
-            smoothed_means = jnp.where(mask[:, None], smoothed_means, 0.0)
-            smoothed_covariances = jnp.where(
-                mask[:, None, None], smoothed_covariances, 0.0
-            )
-            smoothed_cross_covariances = jnp.where(
-                mask[1:, None, None], smoothed_cross_covariances, 0.0
-            )
-            b_ones = jnp.where(mask[:, None], b_ones, 0.0)
+            Ex = jnp.where(mask[:, None], Ex, 0.0)
+            Vx = jnp.where(mask[:, None, None], Vx, 0.0)
+            Expxn = jnp.where(mask[1:, None, None], Expxn, 0.0)
             y = jnp.where(mask[:, None], y, 0.0)
+        ExxT = Vx + jnp.einsum("ti,tj->tij", Ex, Ex)
 
-        # shorthand
-        Ex = smoothed_means
-        Exp = smoothed_means[:-1]
-        Exn = smoothed_means[1:]
-        Vx = smoothed_covariances
-        Vxp = smoothed_covariances[:-1]
-        Vxn = smoothed_covariances[1:]
-        Expxn = smoothed_cross_covariances
+        ## initial state: x[0] = m(u[0]) + noise
+        ZTZ, ZTY = regression_stats(
+            Phi_x=None, 
+            Phi_1=features("m", inputs[0]), 
+            Ey=Ex[0]
+            )
+        init_stats = (ZTZ, ZTY, ExxT[0], 1)
+
+        ## dynamics: x[t+1] = A(u[t]) x[t] + b(u[t]) + noise, for t = 0...T-2
         up = inputs[:-1]
+        valid = None if mask is None else mask[1:]
+        ZTZ, ZTY = regression_stats(
+            Phi_x=features("A", up, valid),
+            Phi_1=features("b", up, valid),
+            ExxT=ExxT[:-1], # ExpxpT
+            Ex=Ex[:-1],     # Exp
+            ExyT=Expxn,
+            Ey=Ex[1:],      # Exn
+        )
+        dynamics_stats = (ZTZ, ZTY, ExxT[1:].sum(0), num_timesteps - 1)
 
-        # mask shorthand if needed
-        if mask is not None:
-            Exp = jnp.where(mask[1:, None], Exp, 0.0)
-            Vxp = jnp.where(mask[1:, None, None], Vxp, 0.0)
+        ## emissions: y[t] = C(u[t]) x[t] + d(u[t]) + noise
+        ZTZ, ZTY = regression_stats(
+            features("C", inputs, mask),
+            features("d", inputs, mask),
+            ExxT=ExxT,
+            Ex=Ex,
+            ExyT=jnp.einsum("ti,tj->tij", Ex, y),
+            Ey=y,
+        )
+        emissions_stats = (ZTZ, ZTY, y.T @ y, num_timesteps)
 
-        ## expected sufficient statistics for the initial distribution
-        Ex0 = smoothed_means[0]
-        Ex0x0T = smoothed_covariances[0] + jnp.outer(Ex0, Ex0)
-        init_stats = (Ex0, Ex0x0T, 1)
-
-        # full E-step sufficient stats for initial wGP
-        if self.use_initial_prior:
-            m0_targets = Ex0.reshape(1, 1, self.state_dim)
-            XTX_m0 = jnp.ones((1, 1, 1))
-
-            _cond = (
-                up[0].reshape(1) if up[0].ndim == 0 else up[0].reshape(1, up.shape[1])
-            )
-            ZTZ_m0, ZTY_m0 = weightspace_stats(
-                self.priors["init"].evaluate_basis(_cond),
-                XTX_m0,
-                m0_targets,
-            )
-            init_gp_stats = (ZTZ_m0, ZTY_m0, Ex0x0T, 1)
-        else:
-            init_gp_stats = None
-
-        ## expected sufficient statistics for the dynamics
-        # let zp[t] = [x[t], u[t]] for t = 0...T-2
-        # let xn[t] = x[t+1]          for t = 0...T-2
-        sum_xpxpT = Vxp.sum(0) + Exp.T @ Exp
-        sum_xpxnT = Expxn.sum(0)
-        sum_xnxnT = Vxn.sum(0) + Exn.T @ Exn
-        if self.use_dynamics_bias:
-            bp = b_ones[1:]
-            sum_xpT = Exp.T @ bp
-            sum_xpxpT = jnp.block([[sum_xpxpT, sum_xpT], [sum_xpT.T, bp.T @ bp]])
-            sum_xpxnT = jnp.block([[Expxn.sum(0)], [bp.T @ Exn]])
-        dynamics_stats = (sum_xpxpT, sum_xpxnT, sum_xnxnT, num_timesteps - 1)
-
-        # full E-step sufficient stats for dynamics wGP
-        if self.use_dynamics_prior:
-            _Phi = self.priors["dynamics"].evaluate_basis(up)
-            if mask is not None:
-                _Phi = jnp.where(mask[1:, None], _Phi, 0.0)
-            ExpxpT = jnp.einsum("ti,tj->tij", Exp, Exp) + Vxp
-            sum_zpzpT, sum_zpxnT = weightspace_stats(_Phi, XTX=ExpxpT, XTY=Expxn)
-            if self.use_dynamics_bias:
-                sum_zpT, sum_znT = weightspace_stats(
-                    _Phi, XTX=Exp[:, None, :], XTY=Exn[:, None, :]
-                )
-                sum_zpzpT = jnp.block(
-                    [
-                        [sum_zpzpT, sum_zpT.T],
-                        [sum_zpT, jnp.einsum("tk,tl->kl", _Phi, _Phi)],
-                    ]
-                )
-                sum_zpxnT = jnp.concatenate([sum_zpxnT, sum_znT], axis=0)
-            dynamics_gp_stats = (
-                sum_zpzpT,
-                sum_zpxnT,
-                sum_xnxnT,
-                num_timesteps - 1,
-            )
-        else:
-            dynamics_gp_stats = None
-
-        ## expected sufficient statistics for the emissions
-        sum_xxT = Vx.sum(0) + Ex.T @ Ex
-        sum_xyT = Ex.T @ y
-        sum_yyT = y.T @ y
-        if self.use_emissions_bias:
-            sum_xT = Ex.T @ b_ones
-            sum_xxT = jnp.block([[sum_xxT, sum_xT], [sum_xT.T, b_ones.T @ b_ones]])
-            sum_xyT = jnp.block([[sum_xyT], [b_ones.T @ y]])
-        emission_stats = (sum_xxT, sum_xyT, sum_yyT, num_timesteps)
-
-        # full E-step sufficient stats for emissions wGP
-        if self.use_emissions_prior:
-            _Phi = self.priors["emissions"].evaluate_basis(inputs)
-            if mask is not None:
-                _Phi = jnp.where(mask[:, None], _Phi, 0.0)
-            ExxT = jnp.einsum("ti,tj->tij", Ex, Ex) + Vx
-            ExyT = jnp.einsum("ti,tj->tij", Ex, y)
-            sum_zzT, sum_zyT = weightspace_stats(_Phi, ExxT, ExyT)
-
-            if self.use_emissions_bias:
-                sum_zT, sum_yT = weightspace_stats(
-                    _Phi, XTX=Ex[:, None, :], XTY=y[:, None, :]
-                )
-                sum_zzT = jnp.block(
-                    [
-                        [sum_zzT, sum_zT.T],
-                        [sum_zT, jnp.einsum("tk,tl->kl", _Phi, _Phi)],
-                    ]
-                )
-                sum_zyT = jnp.concatenate([sum_zyT, sum_yT], axis=0)
-
-            emissions_gp_stats = (
-                sum_zzT,
-                sum_zyT,
-                sum_yyT,
-                num_timesteps,
-            )
-        else:
-            emissions_gp_stats = None
-
-        return (
-            init_stats,
-            init_gp_stats,
-            dynamics_stats,
-            dynamics_gp_stats,
-            emission_stats,
-            emissions_gp_stats,
-        ), marginal_loglik
+        return {
+            "initial": init_stats,
+            "dynamics": dynamics_stats,
+            "emissions": emissions_stats,
+        }, marginal_loglik
 
     def m_step(
         self,
-        params: ParamsCLDS,
+        params: ParamsCLDS2,
         batch_stats: Tuple,  # inputs: Optional[Float[Array, "num_timesteps input_dim"]]=None,
-    ) -> ParamsCLDS:
-        def fit_linear_regression(ExxT, ExyT, EyyT, N, use_bias):
-            '''Solve a linear regression given sufficient statistics'''
-            W = utils.psd_solve(ExxT, ExyT).T
-            Sigma = (EyyT - W @ ExyT - ExyT.T @ W.T + W @ ExxT @ W.T) / N
-            if use_bias:
-                bias = W[:, -1:]
-                W = W[:, :-1]
-            else:
-                bias = None
-            return W, bias, Sigma
-
-        def fit_gplinear_regression(ZTZ, ZTY, wgp_prior, use_bias):
+    ) -> ParamsCLDS2:
+        def fit_regression(ZTZ, ZTY, YTY, N, prior_precision, Sigma, update_Sigma=True):
             r'''
-            Solve a linear regression in weight-space given sufficient statistics,
-            assuming identity noise covariance: the Sylvester equation
-            ZTZ W + W Sigma = ZTY reduces to (ZTZ + I) W = ZTY
+            MAP estimate of W in the regression y = W^T z + N(0, Sigma) given sufficient
+            statistics, with a N(0, 1) prior on the rows of W where prior_precision is 1
+            (GP weights) and a flat prior where it is 0 (static coefficients). W solves
+                ZTZ W + diag(prior_precision) W Sigma = ZTY,
+            column-wise in the eigenbasis of Sigma = U diag(s) U^T. Sigma is then updated
+            to the expected residual second moment, unless update_Sigma is False.
             '''
-            weights = jax.scipy.linalg.solve(
-                ZTZ + jnp.eye(ZTZ.shape[0]),
-                ZTY,
-                assume_a="pos",
-            )
-            if use_bias:
-                bias = weights[wgp_prior.n_basis_funcs * wgp_prior.input_dim :].reshape(
-                    wgp_prior.n_basis_funcs, wgp_prior.output_dim, 1
-                )
-                weights = weights[: wgp_prior.n_basis_funcs * wgp_prior.input_dim]
+            if any(prior_precision):    # if there's a GP prior
+                Lambda = jnp.diag(jnp.asarray(prior_precision, dtype=ZTZ.dtype))
+                s, U = jnp.linalg.eigh(Sigma)
+                W = vmap(
+                    lambda s_j, ZTY_j: jax.scipy.linalg.solve(
+                        ZTZ + s_j * Lambda, 
+                        ZTY_j, 
+                        assume_a="pos"
+                    ),
+                    in_axes=(0, 1),     # s_j, j-th column of Z^T Y U
+                    out_axes=1,         # output as columns
+                )(s, ZTY @ U) @ U.T
             else:
-                bias = None
-            weights = weights.reshape(
-                wgp_prior.n_basis_funcs, wgp_prior.input_dim, wgp_prior.output_dim
-            ).transpose(0, 2, 1)
-            return weights, bias
+                # flat prior: ordinary least squares, independent of Sigma
+                W = utils.psd_solve(ZTZ, ZTY)
 
-        def fit_gplinear_regression_sylvester(
-            ZTZ, ZTY, YTY, N, 
-            Sigma, wgp_prior, use_bias
-        ):
-            r'''
-            Solve a linear regression in weight-space given sufficient statistics
-                ZTZ W + W Sigma = ZTY
-            '''
-            # weights = utils.jax_solve_sylvester(B, ZTZ, ZTY, assume_a='pos')
-            weights = utils.jax_solve_sylvester_BS(ZTZ, Sigma, ZTY)
-            # weights = utils.solve_sylvester_symmetric(ZTZ, Sigma, ZTY)
+            if update_Sigma:
+                Sigma = (YTY - W.T @ ZTY - ZTY.T @ W + W.T @ ZTZ @ W) / N
+            return W, Sigma
 
-            Sigma = (
-                YTY - weights.T @ ZTY - ZTY.T @ weights + weights.T @ ZTZ @ weights
-            ) / N
+        def fit_block(block, stats, Sigma, update_Sigma=True):
+            '''Fit the regression of one block and unpack W into its (weights, bias, Sigma)'''
+            linear_coef, bias_coef = self.BLOCKS[block]
+            n_linear = self._n_basis(linear_coef) * self.state_dim if linear_coef else 0
+            n_bias   = self._n_basis(bias_coef) if self._has(bias_coef) else 0
 
-            if use_bias:
-                bias = weights[wgp_prior.n_basis_funcs * wgp_prior.input_dim :].reshape(
-                    wgp_prior.n_basis_funcs, wgp_prior.output_dim, 1
-                )
-                weights = weights[: wgp_prior.n_basis_funcs * wgp_prior.input_dim]
-            else:
-                bias = None
+            # For possible mixed cases of GP priors on [linear, bias] blocks
+            prior_precision = [float(linear_coef in self.gp_priors)] * n_linear + \
+                              [float(bias_coef in self.gp_priors)] * n_bias
 
-            weights = weights.reshape(
-                wgp_prior.n_basis_funcs, wgp_prior.input_dim, wgp_prior.output_dim
-            ).transpose(0, 2, 1)
-            return weights, bias, Sigma
-    
+            W, Sigma = fit_regression(*stats, prior_precision, Sigma, update_Sigma)
+
+            # (n_basis * input_dim, output_dim) -> (n_basis, output_dim, input_dim)
+            output_dim = W.shape[1]
+
+            # Static coefficients drop the basis (0-th) axis
+            ## Linear component
+            weights = W[:n_linear].reshape(-1, self.state_dim, output_dim).transpose(0, 2, 1)
+            if linear_coef is not None and linear_coef not in self.gp_priors:
+                weights = weights[0]
+
+            ## Bias component
+            bias = W[n_linear:].reshape(-1, output_dim, 1)
+            if not self._has(bias_coef): # disabled biases are zero
+                bias = jnp.zeros(output_dim)
+            elif bias_coef not in self.gp_priors:
+                bias = bias[0, :, 0]
+            
+            return weights, bias, utils.symmetrize(Sigma)
+
         # Sum the statistics across all batches
         stats = jax.tree_util.tree_map(partial(jnp.sum, axis=0), batch_stats)
-        (
-            init_stats,
-            init_gp_stats,
-            dynamics_stats,
-            dynamics_gp_stats,
-            emission_stats,
-            emissions_gp_stats,
-        ) = stats
 
-        # Perform MLE estimation jointly
-        if self.use_initial_prior:
-            m, _, S = fit_gplinear_regression_sylvester(
-                *init_gp_stats, 
-                Sigma=params.initial_cov,
-                wgp_prior=self.priors["init"],
-                use_bias=False,
+        _, m, S = fit_block(
+            block="initial", 
+            stats=stats["initial"], 
+            Sigma=params.initial_cov
             )
-        else:
-            sum_x0, sum_x0x0T, N0 = init_stats
-            m = sum_x0 / N0
-            S = sum_x0x0T / N0 - jnp.outer(m, m)
 
-        # Dynamics M-step
-        if self.use_dynamics_prior and self.fix_Q:
-            As, bs = fit_gplinear_regression(
-                *dynamics_gp_stats[:2],
-                wgp_prior=self.priors["dynamics"],
-                use_bias=self.use_dynamics_bias,
+        # with fix_Q, Q stays the identity (for identifiability)
+        As, bs, Q = fit_block(
+            block="dynamics",
+            stats=stats["dynamics"],
+            Sigma=jnp.eye(self.state_dim) if self.fix_Q else params.dynamics_cov,
+            update_Sigma=not self.fix_Q,
+        )
+
+        Cs, ds, R = fit_block(
+            block="emissions", 
+            stats=stats["emissions"], 
+            Sigma=params.emissions_cov
             )
-        elif self.use_dynamics_prior:
-            As, bs, Q = fit_gplinear_regression_sylvester(
-                *dynamics_gp_stats,
-                Sigma=params.dynamics_cov,
-                wgp_prior=self.priors["dynamics"],
-                use_bias=self.use_dynamics_bias,
-            )
-        else:
-            # MLE of A, b does not depend on Q
-            As, bs, Q = fit_linear_regression(*dynamics_stats, self.use_dynamics_bias)
-
-        if self.fix_Q:
-            Q = jnp.eye(self.state_dim)
-
-        # # Use the following for homogeneous bias
-        # b = jnp.mean(bs, axis=0)
-        # bs = jnp.tile(b, (len(up), 1))
-
-        # Emission M-step
-        if self.use_emissions_prior:
-            # In weight space
-            Cs, ds, R = fit_gplinear_regression_sylvester(
-                *emissions_gp_stats,
-                Sigma=params.emissions_cov,
-                wgp_prior=self.priors["emissions"],
-                use_bias=self.use_emissions_bias,
-            )
-        else:
-            Cs, ds, R = fit_linear_regression(*emission_stats, self.use_emissions_bias)
 
         params = ParamsCLDS2(
             initial_mean=m,
-            initial_cov=utils.symmetrize(S),
+            initial_cov=S,
             dynamics_weights=As,
             dynamics_bias=bs,
-            dynamics_cov=utils.symmetrize(Q),
+            dynamics_cov=Q,
             emissions_weights=Cs,
             emissions_bias=ds,
-            emissions_cov=utils.symmetrize(R),
+            emissions_cov=R,
         )
         return params
 
     def log_prob(self, params, emissions, conditions):
         """Compute the log probability of the emissions given the parameters"""
 
-        def batch_log_prob(_emissions, _conditions):
-            log_prior = self.log_prior(params, _conditions)
+        def _mll(_emissions, _conditions):
             marginal_loglik, _, _ = self.smoother(params, _emissions, _conditions)
-            return log_prior + marginal_loglik
+            return marginal_loglik
 
-        return vmap(batch_log_prob)(emissions, conditions).sum()
+        # the prior on the parameters is counted once, not per batch
+        return vmap(_mll)(emissions, conditions).sum() + self.log_prior(params)
 
     def marginal_log_lik(self, params, emissions, conditions):
         """Compute the marginal log likelihood of the emissions given the parameters"""
 
-        def batch_marginal_log_lik(_emissions, _conditions):
+        def _mll(_emissions, _conditions):
             (marginal_loglik, _, _) = self.smoother(params, _emissions, _conditions)
             return marginal_loglik
 
-        return vmap(batch_marginal_log_lik)(emissions, conditions).sum()
+        return vmap(_mll)(emissions, conditions).sum()
 
     def fit(
         self,
