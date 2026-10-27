@@ -11,6 +11,7 @@ import jax
 import numpy as np
 from functools import reduce
 from jaxtyping import Float, Array
+from typing import Optional
 import mpmath
 import itertools
 
@@ -437,6 +438,80 @@ def psd_solve(A, b, diagonal_boost=0.0):
 def safe_wrap(X):
     return jnp.where(jnp.isclose(X, 0.0), 0.0, X)
 
+def regression_stats_from_moments(
+        Phi_x: Optional[Float[Array, "n_steps n_basis_x"]],
+        Phi_1: Optional[Float[Array, "n_steps n_basis_1"]],
+        ExxT: Optional[Float[Array, "n_steps input_dim input_dim"]] = None,
+        Ex: Optional[Float[Array, "n_steps input_dim"]] = None,
+        ExyT: Optional[Float[Array, "n_steps input_dim output_dim"]] = None,
+        Ey: Optional[Float[Array, "n_steps output_dim"]] = None,
+    ) -> tuple:
+    """
+    Compute the expected sufficient statistics Z^T Z and Z^T Y, summed over the time
+    steps t, of the regression
+        y_t = W^T z_t + noise,    z_t = [phi_1 x_t ; ... ; phi_L x_t ; Phi_1(u_t)],
+    where phi_l = Phi_x(u_t)[l], i.e. the Kronecker block Phi_x(u_t) kron x_t is ordered
+    by basis function first, then by state dimension.
+
+    x_t is the regressor (the latent state) and y_t the target (x_{t+1} for the dynamics,
+    the observation for the emissions, x_0 for the initial state). Since x_t is latent,
+    the statistics are built from its per-step posterior moments: ExxT = E[x_t x_t^T],
+    Ex = E[x_t], ExyT = E[x_t y_t^T] and Ey = E[y_t].
+
+    Phi_x and Phi_1 are the bases of the coefficient on x_t and of the bias; a static
+    coefficient has the constant basis [1], and a term is dropped when its basis is None
+    (in which case its moments are not needed).
+    """
+    ZTZ, ZTY = [], []
+    if Phi_x is not None:
+        n_x = Phi_x.shape[1] * ExxT.shape[-1]
+        ZTZ.append(
+            [jnp.einsum("tk,tl,tij->kilj", Phi_x, Phi_x, ExxT).reshape(n_x, n_x)]
+        )
+        ZTY.append(jnp.einsum("tk,tim->kim", Phi_x, ExyT).reshape(n_x, -1))
+    if Phi_1 is not None:
+        ZTZ_11 = Phi_1.T @ Phi_1
+        if Phi_x is not None:
+            ZTZ_x1 = jnp.einsum("tk,tl,ti->kil", Phi_x, Phi_1, Ex).reshape(n_x, -1)
+            ZTZ[0].append(ZTZ_x1)
+            ZTZ.append([ZTZ_x1.T, ZTZ_11])
+        else:
+            ZTZ.append([ZTZ_11])
+        ZTY.append(Phi_1.T @ Ey)
+    return jnp.block(ZTZ), jnp.concatenate(ZTY, axis=0)
+
+def solve_map_regression(ZTZ, ZTY, has_prior, Sigma):
+    r'''
+    MAP estimate of W in the regression y = W^T z + N(0, Sigma) given sufficient
+    statistics. Takes a N(0, 1) prior on the rows of W where `has_prior` is True
+    (GP weights) and a flat prior elsewhere (static coefficients). 
+    
+    W solves
+        ZTZ W + diag(has_prior) W Sigma = ZTY,
+    column-wise in the eigenbasis of Sigma = U diag(s) U^T.
+        (ZTZ + s_i Lambda)(WU)[:,i] = (ZTY @ U)[:,i]
+    '''
+    if any(has_prior):          # if there's a GP prior
+        Lambda = jnp.diag(jnp.asarray(has_prior, dtype=ZTZ.dtype))
+        s, U = jnp.linalg.eigh(Sigma)
+        W = jax.vmap(
+            lambda s_j, ZTY_j: jax.scipy.linalg.solve(
+                ZTZ + s_j * Lambda, 
+                ZTY_j, 
+                assume_a="pos"
+            ),
+            in_axes=(0, 1),     # s_j, j-th column of Z^T Y U
+            out_axes=1,         # output as columns
+        )(s, ZTY @ U) @ U.T
+    else:
+        # flat prior: ordinary least squares, independent of Sigma
+        W = psd_solve(ZTZ, ZTY)
+    return W
+
+def residual_covariance(ZTZ, ZTY, YTY, N, W):
+    """Expected residual second moment."""
+    Sigma = (YTY - W.T @ ZTY - ZTY.T @ W + W.T @ ZTZ @ W) / N
+    return Sigma
 
 # %%
 def jax_solve_sylvester_BS(A, B, C, **kwargs):

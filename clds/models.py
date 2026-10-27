@@ -703,10 +703,15 @@ class CLDS2:
         return gp_priors
 
     def _has(self, c) -> bool:
-        """Whether coefficient c is part of the model (the biases are optional)."""
-        return {"b": self.use_dynamics_bias, "d": self.use_emissions_bias}.get(
-            c, c is not None
-        )
+        """
+        Whether coefficient c is part of the model: 
+        A, C and m always are, the biases b and d are optional.
+        """
+        if c == "b":
+            return self.use_dynamics_bias
+        if c == "d":
+            return self.use_emissions_bias
+        return c in self.COEFFICIENTS
 
     def _coef_shape(self, c) -> tuple:
         """Shape of coefficient c at a single time step."""
@@ -953,38 +958,6 @@ class CLDS2:
         where Phi_x and Phi_1 are the bases of the coefficient on x and of the bias
         (the constant [1] for a static coefficient), evaluated at the conditions u_t = inputs[t].
         """
-
-        def regression_stats(
-            Phi_x: Optional[Float[Array, "n_steps n_basis_x"]],
-            Phi_1: Optional[Float[Array, "n_steps n_basis_1"]],
-            ExxT: Float[Array, "n_steps input_dim input_dim"] = None,
-            Ex: Float[Array, "n_steps input_dim"] = None,
-            ExyT: Float[Array, "n_steps input_dim output_dim"] = None,
-            Ey: Float[Array, "n_steps output_dim"] = None,
-        ) -> tuple:
-            """
-            Compute the expected sufficient statistics Z^T Z and Z^T Y of the regression
-            y_t = W^T z_t + noise, with features z_t = [Phi_x(u_t) kron x_t ; Phi_1(u_t)]
-            ordered as (basis, state). A term is dropped when its basis is None.
-            """
-            ZTZ, ZTY = [], []
-            if Phi_x is not None:
-                n_x = Phi_x.shape[1] * ExxT.shape[-1]
-                ZTZ.append(
-                    [jnp.einsum("tk,tl,tij->kilj", Phi_x, Phi_x, ExxT).reshape(n_x, n_x)]
-                )
-                ZTY.append(jnp.einsum("tk,tim->kim", Phi_x, ExyT).reshape(n_x, -1))
-            if Phi_1 is not None:
-                ZTZ_11 = Phi_1.T @ Phi_1
-                if Phi_x is not None:
-                    ZTZ_x1 = jnp.einsum("tk,tl,ti->kil", Phi_x, Phi_1, Ex).reshape(n_x, -1)
-                    ZTZ[0].append(ZTZ_x1)
-                    ZTZ.append([ZTZ_x1.T, ZTZ_11])
-                else:
-                    ZTZ.append([ZTZ_11])
-                ZTY.append(Phi_1.T @ Ey)
-            return jnp.block(ZTZ), jnp.concatenate(ZTY, axis=0)
-
         def features(c, u, valid=None):
             """Basis of coefficient c at conditions u, zeroed at invalid steps (None if disabled)."""
             if not self._has(c):
@@ -1018,7 +991,7 @@ class CLDS2:
 
         ## initial state: x[0] = m(u[0]) + noise
         # slice with [:1] to keep the leading time axis (a single step) expected by regression_stats
-        ZTZ, ZTY = regression_stats(
+        ZTZ, ZTY = utils.regression_stats_from_moments(
             Phi_x=None,
             Phi_1=features("m", inputs[:1]),
             Ey=Ex[:1],
@@ -1028,7 +1001,7 @@ class CLDS2:
         ## dynamics: x[t+1] = A(u[t]) x[t] + b(u[t]) + noise, for t = 0...T-2
         up = inputs[:-1]
         valid = None if mask is None else mask[1:]
-        ZTZ, ZTY = regression_stats(
+        ZTZ, ZTY = utils.regression_stats_from_moments(
             Phi_x=features("A", up, valid),
             Phi_1=features("b", up, valid),
             ExxT=ExxT[:-1], # ExpxpT
@@ -1039,9 +1012,9 @@ class CLDS2:
         dynamics_stats = (ZTZ, ZTY, ExxT[1:].sum(0), num_timesteps - 1)
 
         ## emissions: y[t] = C(u[t]) x[t] + d(u[t]) + noise
-        ZTZ, ZTY = regression_stats(
-            features("C", inputs, mask),
-            features("d", inputs, mask),
+        ZTZ, ZTY = utils.regression_stats_from_moments(
+            Phi_x=features("C", inputs, mask),
+            Phi_1=features("d", inputs, mask),
             ExxT=ExxT,
             Ex=Ex,
             ExyT=jnp.einsum("ti,tj->tij", Ex, y),
@@ -1060,58 +1033,31 @@ class CLDS2:
         params: ParamsCLDS2,
         batch_stats: Tuple,  # inputs: Optional[Float[Array, "num_timesteps input_dim"]]=None,
     ) -> ParamsCLDS2:
-        def fit_regression(ZTZ, ZTY, YTY, N, prior_precision, Sigma, update_Sigma=True):
-            r'''
-            MAP estimate of W in the regression y = W^T z + N(0, Sigma) given sufficient
-            statistics, with a N(0, 1) prior on the rows of W where prior_precision is 1
-            (GP weights) and a flat prior where it is 0 (static coefficients). W solves
-                ZTZ W + diag(prior_precision) W Sigma = ZTY,
-            column-wise in the eigenbasis of Sigma = U diag(s) U^T. Sigma is then updated
-            to the expected residual second moment, unless update_Sigma is False.
-            '''
-            if any(prior_precision):    # if there's a GP prior
-                Lambda = jnp.diag(jnp.asarray(prior_precision, dtype=ZTZ.dtype))
-                s, U = jnp.linalg.eigh(Sigma)
-                W = vmap(
-                    lambda s_j, ZTY_j: jax.scipy.linalg.solve(
-                        ZTZ + s_j * Lambda, 
-                        ZTY_j, 
-                        assume_a="pos"
-                    ),
-                    in_axes=(0, 1),     # s_j, j-th column of Z^T Y U
-                    out_axes=1,         # output as columns
-                )(s, ZTY @ U) @ U.T
-            else:
-                # flat prior: ordinary least squares, independent of Sigma
-                W = utils.psd_solve(ZTZ, ZTY)
-
-            if update_Sigma:
-                Sigma = (YTY - W.T @ ZTY - ZTY.T @ W + W.T @ ZTZ @ W) / N
-            return W, Sigma
-
         def fit_block(block, stats, Sigma, update_Sigma=True):
             '''Fit the regression of one block and unpack W into its (weights, bias, Sigma)'''
-            linear_coef, bias_coef = self.BLOCKS[block]
-            n_linear = self._n_basis(linear_coef) * self.state_dim if linear_coef else 0
-            n_bias   = self._n_basis(bias_coef) if self._has(bias_coef) else 0
+            lin_coef, bias_coef = self.BLOCKS[block]
+            n_lin  = self._n_basis(lin_coef) * self.state_dim if lin_coef else 0
+            n_bias = self._n_basis(bias_coef) if self._has(bias_coef) else 0
 
             # For possible mixed cases of GP priors on [linear, bias] blocks
-            prior_precision = [float(linear_coef in self.gp_priors)] * n_linear + \
-                              [float(bias_coef in self.gp_priors)] * n_bias
+            has_prior = [lin_coef in self.gp_priors] * n_lin + \
+                        [bias_coef in self.gp_priors] * n_bias
 
-            W, Sigma = fit_regression(*stats, prior_precision, Sigma, update_Sigma)
+            W = utils.solve_map_regression(*stats[:2], has_prior, Sigma)
+            if update_Sigma:
+                Sigma = utils.residual_covariance(*stats, W)
 
             # (n_basis * input_dim, output_dim) -> (n_basis, output_dim, input_dim)
             output_dim = W.shape[1]
 
             # Static coefficients drop the basis (0-th) axis
             ## Linear component
-            weights = W[:n_linear].reshape(-1, self.state_dim, output_dim).transpose(0, 2, 1)
-            if linear_coef is not None and linear_coef not in self.gp_priors:
+            weights = W[:n_lin].reshape(-1, self.state_dim, output_dim).transpose(0, 2, 1)
+            if lin_coef is not None and lin_coef not in self.gp_priors:
                 weights = weights[0]
 
             ## Bias component
-            bias = W[n_linear:].reshape(-1, output_dim, 1)
+            bias = W[n_lin:].reshape(-1, output_dim, 1)
             if not self._has(bias_coef): # disabled biases are zero
                 bias = jnp.zeros(output_dim)
             elif bias_coef not in self.gp_priors:
@@ -1241,12 +1187,13 @@ class CLDS2:
                 emissions, conditions, mask
             )
             mll = lls.sum()
-            lp = mll + self.log_prior(params)
+            log_prior = self.log_prior(params)
+            lp = mll + log_prior
 
             # Update with M-step
-            params = self.m_step(params, batch_stats)
+            next_params = self.m_step(params, batch_stats)
 
-            return params, (lp, mll)
+            return next_params, (lp, mll)
 
         log_probs, marginal_log_liks = [], []
 
