@@ -16,16 +16,12 @@ from .utils import logprob_analytic
 from functools import partial
 from jax import jit, lax, vmap
 from tqdm.auto import trange
-
-from dynamax.linear_gaussian_ssm.inference import make_lgssm_params, lgssm_smoother
-
 import logging
 
 logging.basicConfig(
     level=logging.INFO, format="[%(filename)s][%(asctime)s] %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
-from scipy.linalg import solve_sylvester
 
 from .params import (
     ParamsEmission,

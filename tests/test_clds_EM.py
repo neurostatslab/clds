@@ -25,6 +25,12 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from clds.models import CLDS2
+from clds.utils import Tm_basis
+
+# ===========================================================================================
+# Constants
+# ===========================================================================================
 
 LOCAL_UTILS_MODULE = "clds.utils" 
 ATOL = 5e-8
@@ -40,6 +46,9 @@ COEFS = {  # (coefficient on x, bias) of each block
     "initial": (None, "m"),
 }
 
+# ===========================================================================================
+# Main
+# ===========================================================================================
 
 def _close(actual, expected, message=""):
     actual, expected = np.asarray(actual), np.asarray(expected)
@@ -88,6 +97,9 @@ def _logpdf_numpy(y, mean, cov):
     return -0.5 * (z @ z + 2 * np.log(np.diag(L)).sum()
                    + len(y) * np.log(2 * np.pi))
 
+
+# ===========================================================================================
+# Math for filter, smoother and log-prob marginals
 
 def _dense_posterior(*, m0, S0, As, Q, bs, Cs, R, ys, ds=None):
     r"""
@@ -185,6 +197,8 @@ def test_logprob_uses_one_covariance_for_quad_and_logdet(local_utils, scale):
     actual = local_utils.logprob_analytic(jnp.asarray(y), jnp.asarray(mean), jnp.asarray(cov))
     _close(actual, _logpdf_numpy(y, mean, cov), "Gaussian density; check hidden jitter")
 
+# ===========================================================================================
+# Sylvester
 
 def test_sylvester_residual_for_psd_gram_and_full_covariance(local_utils):
     rng = np.random.default_rng(7)
@@ -208,10 +222,56 @@ def test_sylvester_symmetric_residual_for_psd_gram_and_full_covariance(local_uti
     _close(W, truth, "Sylvester solution")
     _close(G @ np.asarray(W) + np.asarray(W) @ Q, H, "Sylvester residual")
 
+# ===========================================================================================
+# EM
+
+@pytest.fixture(scope="module", params=[False, True], ids=["learn_Q", "fix_Q"])
+def clds_case(request):
+    fix_Q = request.param
+    latent_dim = 2
+    emission_dim = 3
+    condition_dim = 1
+
+    # Define bases
+    _sigma, _kappa, _period = 0.5, 0.1, 2*jnp.pi
+    torus_basis_funcs = Tm_basis(5, M_conditions=1, sigma=_sigma, kappa=_kappa, period=_period)
+
+    # Define model
+    model = CLDS2(
+        state_dim=latent_dim,
+        emission_dim=emission_dim,
+        basis=torus_basis_funcs,
+        gp_priors=["A", "b", "m"],
+        use_dynamics_bias=True,
+        use_emissions_bias=False,
+        fix_Q=fix_Q,
+        )
+
+    # Define params
+    S0 = jnp.array([[1.0, 0.2], [0.2, 0.8]])
+    Q = jnp.array([[1.0, 0.1], [0.1, 10.0]])
+    assert jnp.all(jnp.linalg.eigvalsh(S0) >= -1e-7)
+    assert jnp.all(jnp.linalg.eigvalsh(Q) >= -1e-7)
+
+    params = model.initialize_params(
+        key=jax.random.key(0)
+        )._replace( # use nonidentity to ensure no false-wins
+            initial_cov=S0,
+            dynamics_cov=jnp.eye(latent_dim) if fix_Q else Q,
+            # emissions_cov=noise_scale**2 * jnp.eye(emission_dim),
+        )
+
+    return {
+        "model": model,
+        "params": params,
+        "condition_dim": condition_dim,
+        "fixed_covariances": ("dynamics",) if fix_Q else (),
+    }
+
 
 @pytest.fixture(scope="module")
 def fitting_case(clds_case):
-    """The only model-construction adapter is the external clds_case fixture."""
+    """The only model-construction adapter is the clds_case fixture."""
     model = clds_case["model"]
 
     def as64(x):
@@ -311,7 +371,7 @@ def step(fitting_case, request):
     )
 
 
-def _regression(model, stats, block):
+def _regression_stats(stats, block):
     """Return ZTZ, ZTY, YTY, N from batch-summed E-step statistics. 
 
     W is the regression coefficient matrix, including bias rows when enabled.
@@ -348,14 +408,14 @@ def _pack(model, params, block):
     return W, has_prior
 
 
-def _regression_terms(fitting_case, params, stats, block):
+def _regression_objectives(fitting_case, params, stats, block):
     """Return the block's expected complete-data log likelihood and log prior.
 
     Evaluate candidate parameters using fixed E-step sufficient statistics.
     Parameter-independent constants are omitted (other terms in the ECLL). 
     The sum is the block's MAP-EM surrogate objective.
     """
-    ZTZ, ZTY, YTY, N = _regression(fitting_case.model, stats, block)
+    ZTZ, ZTY, YTY, N = _regression_stats(stats, block)
     
     W, has_prior = _pack(fitting_case.model, params, block)
     cov = getattr(params, BLOCKS[block][-1])
@@ -440,7 +500,7 @@ def _reference_stats(fitting_case, params, block):
 
 @pytest.mark.parametrize("block", BLOCKS)
 def test_e_step_statistics_match_explicit_features(fitting_case, step, block):
-    actual = _regression(fitting_case.model, step.stats, block)
+    actual = _regression_stats(step.stats, block)
     expected = _reference_stats(fitting_case, step.old, block)
     for name, a, b in zip(("G", "H", "YTY", "N"), actual, expected):
         _close(a, b, f"{block} {name}: check basis ordering, bias blocks, counts, lag moments")
@@ -464,7 +524,7 @@ def test_likelihood_and_prior_scores_match_fixed_moments(fitting_case, step, blo
 
     def from_moments(alpha):
         # step.stats is held fixed; do NOT differentiate through another E-step.
-        return _regression_terms(fitting_case, at(alpha), step.stats, block)
+        return _regression_objectives(fitting_case, at(alpha), step.stats, block)
 
     zero, one = jnp.asarray(0.0), jnp.asarray(1.0)
     _, actual_score = jax.jvp(actual, (zero,), (one,))
@@ -475,7 +535,7 @@ def test_likelihood_and_prior_scores_match_fixed_moments(fitting_case, step, blo
 
 @pytest.mark.parametrize("block", BLOCKS)
 def test_m_step_normal_equation_and_covariance(fitting_case, step, block):
-    ZTZ, ZTY, YTY, N = _regression(fitting_case.model, step.stats, block)
+    ZTZ, ZTY, YTY, N = _regression_stats(step.stats, block)
     W, has_prior = _pack(fitting_case.model, step.new, block)
     old_cov = getattr(step.old, BLOCKS[block][-1])
     new_cov = getattr(step.new, BLOCKS[block][-1])
@@ -493,9 +553,9 @@ def test_m_step_normal_equation_and_covariance(fitting_case, step, block):
 @pytest.mark.parametrize("block", BLOCKS)
 def test_m_step_increases_fixed_posterior_surrogate(fitting_case, step, block):
     weight_candidate = _candidate(step.old, step.new, block, weights_only=True)
-    f_old = _regression_terms(fitting_case, step.old, step.stats, block).sum()
-    f_weights = _regression_terms(fitting_case, weight_candidate, step.stats, block).sum()
-    f_cov = _regression_terms(fitting_case, step.new, step.stats, block).sum()
+    f_old = _regression_objectives(fitting_case, step.old, step.stats, block).sum()
+    f_weights = _regression_objectives(fitting_case, weight_candidate, step.stats, block).sum()
+    f_cov = _regression_objectives(fitting_case, step.new, step.stats, block).sum()
     _nonnegative(f_weights - f_old, f_weights, f_old, message=f"{block}: F(weights)-F(old)")
     _nonnegative(f_cov - f_weights, f_cov, f_weights, message=f"{block}: F(cov)-F(weights)")
 
@@ -504,8 +564,8 @@ def test_m_step_increases_fixed_posterior_surrogate(fitting_case, step, block):
 def test_single_step_map_improvement_and_em_bound(fitting_case, step, block):
     candidate = step.new if block == "all" else _candidate(step.old, step.new, block)
     selected = tuple(BLOCKS) if block == "all" else (block,)
-    f_old = sum(_regression_terms(fitting_case, step.old, step.stats, b).sum() for b in selected)
-    f_new = sum(_regression_terms(fitting_case, candidate, step.stats, b).sum() for b in selected)
+    f_old = sum(_regression_objectives(fitting_case, step.old, step.stats, b).sum() for b in selected)
+    f_new = sum(_regression_objectives(fitting_case, candidate, step.stats, b).sum() for b in selected)
     lp_old = step.old_ll + fitting_case.model.log_prior(step.old)
     lp_new = _logposterior(fitting_case, candidate)
     delta_f, delta_lp = f_new - f_old, lp_new - lp_old
