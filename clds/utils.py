@@ -514,6 +514,91 @@ def residual_covariance(ZTZ, ZTY, YTY, N, W):
     return Sigma
 
 # %%
+def block_hankel(
+    y: Float[Array, "n_steps dim"], num_rows: int
+) -> Float[Array, "num_rows*dim n_cols"]:
+    """
+    Block Hankel matrix whose column t stacks y[t], y[t+1], ..., y[t+num_rows-1],
+    for t = 0, ..., n_steps - num_rows.
+    """
+    n_cols = y.shape[0] - num_rows + 1
+    return jnp.concatenate([y[i : i + n_cols].T for i in range(num_rows)], axis=0)
+
+
+def subspace_id(
+    ys: Float[Array, "n_batches n_steps emission_dim"],
+    state_dim: int,
+    num_lags: int,
+    mask: Optional[Float[Array, "n_batches n_steps"]] = None,
+) -> tuple:
+    r"""
+    Covariance-based stochastic subspace identification of the autonomous, static LDS
+        x_{t+1} = A x_t + noise,    y_t = C x_t + noise,
+    from batches of zero-mean emissions.
+
+    Stacking k = `num_lags` past emissions y_p = [y_t; ...; y_{t+k-1}] and future emissions
+    y_f = [y_{t+k}; ...; y_{t+2k-1}], their cross-covariance factorizes as
+        E[y_f y_p^T] = O K,    O = [C; C A; ...; C A^{k-1}] in \R^{kN x state_dim}
+    so its top `state_dim` left singular vectors span the extended observability matrix O.
+    C is the first block row of O, and A solves the shift invariance O[:-1] A = O[1:] (in blocks).
+    Only the windows of 2k fully observed steps (under `mask`) are used.
+
+    Returns (A, C), in an arbitrary basis of the latent space.
+    """
+    B, T, N = ys.shape
+    k = num_lags
+    if mask is None:
+        mask = jnp.ones((B, T))
+
+    def hankel(y, m):
+        valid = block_hankel(m[:, None], 2 * k).min(axis=0)  # window fully observed
+        return block_hankel(jnp.where(m[:, None] > 0, y, 0.0), 2 * k) * valid, valid.sum()
+
+    H, counts = jax.vmap(hankel)(ys, mask)
+    past, future = H[:, : k * N], H[:, k * N :] # slice rows per batch
+
+    # For each k, y_f = O_k x_{t+k} + noise[t+k:], so E[y_f y_p^T] = O_k E[x_{t+k} y_p^T]
+    cov = jnp.einsum("bic,bjc->ij", future, past) / counts.sum() # empirical E[y_f y_p^T]
+
+    # E[y_f y_p^T] = O K, and we know O has rank state_dim. Form O from SVD.
+    U, s, _ = jnp.linalg.svd(cov)
+    O = U[:, :state_dim] * jnp.sqrt(s[:state_dim])
+
+    # Read of from O = [C; C A; ...; C A^{k-1}]
+    C = O[:N]
+    A = jnp.linalg.lstsq(O[:-N], O[N:])[0]
+    return A, C
+
+
+def ppca(
+    ys: Float[Array, "n_batches n_steps emission_dim"],
+    latent_dim: int,
+    mask: Optional[Float[Array, "n_batches n_steps"]] = None,
+) -> tuple:
+    r"""
+    Closed-form probabilistic PCA (Tipping & Bishop, 1999) of the emissions
+        y = W x + mu + N(0, sigma^2 I),    x ~ N(0, I),
+    with loadings W = U_D (Lambda_D - sigma^2 I)^{1/2} from the top D = `latent_dim`
+    eigenpairs of the sample covariance, and sigma^2 the mean of the remaining eigenvalues.
+    Only the observed steps (under `mask`) are used.
+
+    Returns (W, mu, sigma^2).
+    """
+    N = ys.shape[-1]
+    y = ys.reshape(-1, N)
+    w = jnp.ones(y.shape[0]) if mask is None else mask.reshape(-1).astype(y.dtype)
+    y = jnp.where(w[:, None] > 0, y, 0.0)
+
+    mu = w @ y / w.sum()
+    yc = (y - mu) * w[:, None]
+    evals, evecs = jnp.linalg.eigh(yc.T @ yc / w.sum())
+    evals, evecs = evals[::-1], evecs[:, ::-1]  # descending order
+
+    sigma2 = evals[latent_dim:].mean() if latent_dim < N else 0.0
+    W = evecs[:, :latent_dim] * jnp.sqrt(jnp.maximum(evals[:latent_dim] - sigma2, 0.0))
+    return W, mu, sigma2
+
+# %%
 def jax_solve_sylvester_BS(A, B, C, **kwargs):
     """
     Solve the Sylvester equation AX + XB = C for X using the Bartels-Stewart algorithm.

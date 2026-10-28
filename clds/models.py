@@ -718,7 +718,7 @@ class CLDS2:
         """Number of basis functions of coefficient c (a static one has the basis [1])."""
         return self.priors[c].n_basis_funcs if c in self.gp_priors else 1
 
-    def _basis(self, c, u):
+    def _evaluate_basis(self, c, u) -> Float[Array, "n_steps n_basis_funcs"]:
         """Basis Phi_c(u) of coefficient c at conditions u, [1] for a static coefficient."""
         if c in self.gp_priors:
             return self.priors[c].evaluate_basis(u)
@@ -758,6 +758,111 @@ class CLDS2:
             dynamics_cov=(1.0 if self.fix_Q else noise_scale**2) * jnp.eye(self.state_dim),
             emissions_cov=noise_scale**2 * jnp.eye(self.emission_dim),
         )
+
+    def _estimate_params_from_data(
+        self,
+        emissions: Float[Array, "num_batches num_timesteps emission_dim"],
+        conditions: Float[Array, "num_batches num_timesteps input_dim"],
+        initial_params: ParamsCLDS2 = None,
+        mask: Float[Array, "num_batches num_timesteps"] = None,
+        seed: int = 2,
+        num_lags: int = 5,
+        gp_scale: float = 0.1,
+    ) -> ParamsCLDS2:
+        """
+        Estimate the parameters from the data, ignoring the conditions:
+            1. A by subspace identification of an autonomous, static LDS (`utils.subspace_id`),
+            2. C as the probabilistic PCA loadings (`utils.ppca`), with A expressed in the latent
+               basis of these loadings, where the latents have unit covariance,
+            3. Q = I - A A^T, keeping that latent covariance stationary. With fix_Q, the latents
+               are then whitened, x -> Q^{-1/2} x, so that Q = I (C P C^T is unchanged, with
+               P the stationary latent covariance),
+            4. d as the emissions mean (if use_emissions_bias), and R = sigma^2 I as the PPCA
+               noise (if state_dim < emission_dim).
+        A coefficient with a GP prior gets this initialization as the weight of its constant
+        basis function (assumed to be the first one, as in `utils.Tm_basis`), and its other
+        weights are drawn from N(0, gp_scale^2).
+
+        The other parameters are taken from `initial_params`, defaulting as in `fit`. The result
+        is stored in `self.initial_params`, so that a subsequent `fit` starts from it.
+
+        Parameters
+        ----------
+        emissions, conditions, initial_params, mask, seed :
+            as in `fit`.
+        num_lags : int, optional
+            number of past/future lags k of the block Hankel matrices in the subspace
+            identification, by default 5. Requires (k - 1) * emission_dim >= state_dim.
+        gp_scale : float, optional
+            scale of the random non-constant GP weights, by default 0.1.
+
+        Returns
+        -------
+        params : ParamsCLDS2
+            initial parameters with A and C initialized from the data.
+        """
+        if (num_lags - 1) * self.emission_dim < self.state_dim:
+            raise ValueError(
+                f"num_lags={num_lags} is too small to identify state_dim={self.state_dim} "
+                f"from emission_dim={self.emission_dim}: need (num_lags - 1) * emission_dim >= state_dim."
+            )
+        if 2 * num_lags > emissions.shape[1]:
+            raise ValueError(f"num_lags={num_lags} needs trials of at least {2 * num_lags} steps.")
+
+        key, key_A, key_C, key_d = jxr.split(jxr.PRNGKey(seed), 4)
+        if initial_params is None:
+            initial_params = (
+                self.initialize_params(key) if self.initial_params is None else self.initial_params
+            )
+        D, N = self.state_dim, self.emission_dim
+
+        # C: PCA loadings; A: subspace identification on the centered emissions
+        C, mu, sigma2 = utils.ppca(emissions, D, mask)
+        A_ssid, C_ssid = utils.subspace_id(emissions - mu, D, num_lags, mask)
+
+        # change of latent basis x -> T^{-1} x, with T such that C_ssid T ~= C
+        T = jnp.linalg.lstsq(C_ssid, C)[0]
+        A = jnp.linalg.solve(T, A_ssid @ T)
+
+        # Q = I - A A^T keeps the latent covariance at I; its eigenvalues are floored
+        # in case the estimates of A and C are not exactly consistent
+        s, U = jnp.linalg.eigh(utils.symmetrize(jnp.eye(D) - A @ A.T))
+        s = jnp.maximum(s, 1e-2)
+        if self.fix_Q:
+            # whiten the dynamics noise, x -> Q^{-1/2} x
+            Q_sqrt = (U * jnp.sqrt(s)) @ U.T
+            A, C, Q = jnp.linalg.solve(Q_sqrt, A @ Q_sqrt), C @ Q_sqrt, jnp.eye(D)
+        else:
+            Q = (U * s) @ U.T
+
+        def to_weights(coef_label, coef_value, key):
+            """GP weights of constant function coef: coef / phi_0 on the constant basis, small random elsewhere."""
+            if coef_label not in self.gp_priors:
+                return coef_value
+
+            # First, double check that the first basis function is constant
+            phi = self._evaluate_basis(coef_label, conditions[0, :2])
+            assert jnp.allclose(phi[0, 0], phi[1, 0]), "to_weights assumes basis[0] is constant"
+
+            # Fetch appropriately scaled constant function
+            phi_0 = phi[0, 0]
+
+            # Set other weights to have smaller scale
+            weights = gp_scale * self.priors[coef_label].sample_weights(key)
+            return weights.at[0].set(coef_value.reshape(weights.shape[1:]) / phi_0)
+
+        # Update {A, C, d, Q, R}
+        params = initial_params._replace(
+            dynamics_weights=to_weights("A", A, key_A),
+            dynamics_cov=Q,
+            emissions_weights=to_weights("C", C, key_C),
+        )
+        if self.use_emissions_bias:
+            params = params._replace(emissions_bias=to_weights("d", mu, key_d))
+        if D < N:  # otherwise PPCA has no noise estimate
+            params = params._replace(emissions_cov=sigma2 * jnp.eye(N))
+        self.initial_params = params
+        return params
 
     @staticmethod
     def run_dynamics(
@@ -958,7 +1063,7 @@ class CLDS2:
             """Basis of coefficient c at conditions u, zeroed at invalid steps (None if disabled)."""
             if not self._has(c):
                 return None
-            Phi = self._basis(c, u)
+            Phi = self._evaluate_basis(c, u)
             return Phi if valid is None else jnp.where(valid[:, None], Phi, 0.0)
 
         if mask is not None:
@@ -1123,6 +1228,7 @@ class CLDS2:
         mask: Float[Array, "num_batches num_timesteps"] = None,
         num_iters: int = 50,
         seed: int = 2,
+        data_driven_init: bool = True,
     ):
         """
         Fit the CLDS model to the emissions and conditions using the EM algorithm.
@@ -1141,15 +1247,18 @@ class CLDS2:
             number of EM iterations, by default 50.
         seed : int, optional
             random seed for initialization, by default 2.
+        data_driven_init: bool, default True,
+            initialize parameters from data using static LDS methods (subspace ID, PPCA).
+            Only applied if `initial_params` is None.
 
         Returns
         -------
         params : ParamsCLDS2
             fitted model parameters.
-        log_probs : list
-            log probabilities at each iteration.
+        (marginal_log_liks, log_probs) : list, list
+            marginal log likelihoods and total log probabilities at each iteration.
         """
-        if emissions.ndim != 3:
+        if emissions.ndim != 3: 
             raise ValueError(
                 "emissions should be 3D, of shape (num_batches, num_timesteps, emission_dim)"
             )
@@ -1161,12 +1270,22 @@ class CLDS2:
             conditions = jax.vmap(partial(jnp.roll, axis=0))(conditions, -shift)
             mask = jax.vmap(partial(jnp.roll, axis=0))(mask, -shift)
 
-        if (self.initial_params is None) and (initial_params is None):
-            # use default initialization if no initial params provided
-            initial_params = self.initialize_params(jxr.PRNGKey(seed))
-        elif (self.initial_params is not None) and (initial_params is None):
-            # use previously stored initial params if no initial params provided
-            initial_params = self.initial_params
+        if data_driven_init and (self.initial_params is not None or initial_params is not None):
+            warnings.warn("Initial params take precedence; `data_driven_init` unused.")
+
+        if initial_params is None:
+            if (self.initial_params is not None):
+                # use previously stored initial params if no initial params provided
+                initial_params = self.initial_params
+            else:
+                # use default initialization if no initial params provided
+                initial_params = self.initialize_params(jxr.PRNGKey(seed))
+
+                if data_driven_init:
+                    # Further enchance from data with subspace ID and PPCA 
+                    initial_params = self._estimate_params_from_data(
+                        emissions, conditions, initial_params, mask, seed,
+                    )
 
         if self.fix_Q:
             initial_params = initial_params._replace(
