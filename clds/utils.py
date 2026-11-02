@@ -14,6 +14,7 @@ from jaxtyping import Float, Array
 from typing import Optional
 import mpmath
 import itertools
+import warnings
 
 
 # %%
@@ -341,55 +342,118 @@ def Tm_basis(
     N: int,
     M_conditions: int = 1,
     sigma: float = 1.0,
-    kappa: float = 1.0,
+    kappa: jnp.ndarray | float = 1.0,
     period: jnp.ndarray | float = None,
 ) -> list:
     """
-    Regular Fourier Features sample approximation to GP over the M-dimensional torus.
-    For M=1, this is equivalent to T1_basis.
+    Regular Fourier Features sample approximation to the squared exponential GP over the
+    M-dimensional torus,
+        k(u, u') = sigma^2 prod_d exp(-(u_d - u'_d)^2 / (2 (kappa_d period_d)^2)),
+    with u_d - u'_d wrapped around period_d. The frequencies are n in {-(N-1), ..., N-1}^M,
+    keeping one of each pair +-n, each with a sin and a cos weighted by sqrt(2 S(n)), where S is
+    the spectral measure. The constant function is the first one.
+    For M=1, this is T1_basis with the sqrt(2) weighting.
     Args:
-        N: number of basis functions for each dimension (so total number of basis functions is 2*(N**M_conditions - 1) + 1)
+        N: number of frequencies 0, ..., N-1 for each dimension (so total number of basis functions is (2N-1)**M_conditions)
         M_conditions: number of conditions
-        sigma: kernel parameter
-        kappa: kernel parameter
-        period: period of the torus. Provide `period >= data_interval + 6 * kappa` for non-periodic data.
+        sigma: kernel parameter, the prior std of the GP
+        kappa: kernel parameter, the lengthscale in units of the period, scalar or one per dimension
+        period: period of the torus, scalar or one per dimension, by default 1. See `initialize_basis` for non-periodic data.
     """
+    kappa = np.broadcast_to(np.asarray(kappa, dtype=float), (M_conditions,))
+    period = jnp.broadcast_to(
+        jnp.asarray(1.0 if period is None else period, dtype=float), (M_conditions,)
+    )
 
-    def coef(index_array):
-        return jnp.sqrt(
-            squared_exponential_spectral_measure(
-                jnp.linalg.norm(index_array), sigma, kappa
+    def coef(index):
+        # the spectral measure factorizes over dimensions, and sums to sigma^2 over Z^M
+        return sigma * np.sqrt(
+            np.prod(
+                [
+                    float(squared_exponential_spectral_measure(n, 1.0, k))
+                    for n, k in zip(index, kappa)
+                ]
             )
         )
 
-    if period is None:
-        period = jnp.ones(M_conditions)
-    if isinstance(period, float):
-        period = period * jnp.ones(M_conditions)
+    constant = coef((0,) * M_conditions)
+    basis_funcs = [lambda x: constant]  # only one constant function
+    for index in itertools.product(range(-(N - 1), N), repeat=M_conditions):
+        negative_index = tuple(-n for n in index)
+        if index <= negative_index:  # keep half the indicies
+            continue
+        c, n = np.sqrt(2.0) * coef(index), jnp.array(index, dtype=float)
 
-    basis_funcs = []
-    for index in itertools.product(jnp.arange(N), repeat=M_conditions):
-        if index == (0,) * M_conditions:
-            constant_func = lambda x: coef(jnp.zeros(M_conditions))
-            basis_funcs.append(constant_func)  # only one constant function
-        else:
+        def _f_sin(x, c=c, n=n):  # use defaults to avoid late binding
+            return c * jnp.sin(2 * jnp.pi * jnp.dot(n, jnp.divide(x, period)))
 
-            def _f_sin(x, index=index):  # use defaults to avoid late binding
-                return coef(jnp.array(index)) * jnp.sin(
-                    2 * jnp.pi * jnp.dot(jnp.array(index), jnp.divide(x, period))
-                )
+        def _f_cos(x, c=c, n=n):
+            return c * jnp.cos(2 * jnp.pi * jnp.dot(n, jnp.divide(x, period)))
 
-            def _f_cos(x, index=index):
-                return coef(jnp.array(index)) * jnp.cos(
-                    2 * jnp.pi * jnp.dot(jnp.array(index), jnp.divide(x, period))
-                )
+        basis_funcs.append(_f_sin)
+        basis_funcs.append(_f_cos)
 
-            basis_funcs.append(_f_sin)
-            basis_funcs.append(_f_cos)
-
-    assert len(basis_funcs) == 2 * (N**M_conditions - 1) + 1
+    assert len(basis_funcs) == (2 * N - 1) ** M_conditions
     return basis_funcs
 
+
+def initialize_basis(
+    conditions: Float[Array, "num_batches num_timesteps M_conditions"],
+    lengthscale: jnp.ndarray | float,
+    N: int = None,
+    sigma: float = 1.0,
+    period: list | float = None,
+    mask: Float[Array, "num_batches num_timesteps"] = None,
+    pad: float = 3.0,
+    tol: float = 1e-2,
+) -> list:
+    """
+    Fourier basis of `Tm_basis` for the conditions, with lengthscales in the units of the conditions.
+    Args:
+        conditions: conditions u, used for the range of the non-periodic dimensions
+        lengthscale: lengthscale of the squared exponential kernel, scalar or one per dimension
+        N: number of frequencies per dimension, by default the smallest such that the spectral
+            measure of the highest frequency is below `tol` relative to the constant one
+        sigma: prior std of the GP
+        period: period of each dimension, None for a non-periodic one (scalar for all). A
+            non-periodic dimension gets the period range(u_d) + pad * lengthscale_d, so that the
+            ends of the data are pad lengthscales apart around the torus (correlation exp(-pad^2/2)).
+        mask: timesteps of the conditions to use for their range
+        pad: padding of the non-periodic dimensions, in lengthscales
+        tol: tolerance for the default N
+    """
+    if conditions.ndim != 3:
+        raise ValueError(
+            "Unrecognized conditions shape. Pass (num_trials, num_timesteps, M_conditions)."
+        )
+    M_conditions = conditions.shape[-1]
+    u = conditions.reshape(-1, M_conditions)
+    if mask is not None:
+        u = u[mask.reshape(-1).astype(bool)]
+    u_range = u.max(axis=0) - u.min(axis=0)
+
+    lengthscale = jnp.broadcast_to(
+        jnp.asarray(lengthscale, dtype=float), (M_conditions,)
+    )
+    if np.ndim(period) == 0:
+        period = [period] * M_conditions
+    if len(period) != M_conditions:
+        raise ValueError(f"Pass one period per condition dimension ({M_conditions})")
+    period = jnp.array(
+        [
+            u_range[d] + pad * lengthscale[d] if p is None else p
+            for d, p in enumerate(period)
+        ]
+    )
+
+    kappa = lengthscale / period # make kappa in domain units
+    if N is None:
+        # exp(-2 pi^2 kappa^2 (N-1)^2) < tol for the smallest kappa
+        N = int(np.ceil(np.sqrt(np.log(1 / tol) / 2) / (np.pi * float(kappa.min())))) + 1
+
+    return Tm_basis(
+        N=N, M_conditions=M_conditions, sigma=sigma, kappa=kappa, period=period
+    )
 
 # # %%
 # def logprob_analytic(
