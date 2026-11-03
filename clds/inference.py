@@ -4,7 +4,6 @@
 """
 import jax.numpy as jnp
 import jax.random as jxr
-
 from jax.example_libraries import optimizers
 
 from jax import jit, value_and_grad, vmap
@@ -13,6 +12,7 @@ from tqdm.auto import trange
 from .params import ParamsCLDS, ParamsGP, ParamsBasis
 
 from .models import CLDS
+import warnings
 from functools import partial
 from jaxtyping import Array, Float
 from typing import Optional, NamedTuple
@@ -59,6 +59,12 @@ def fit_em(
     """
     Requires the model to have the e_step and m_step functions implemented
     """
+    warnings.warn(
+        "The standalone clds.inference.fit_em() is under review. "
+        "Use model.fit() (clds.models.CLDS.fit) instead.",
+        category=UserWarning,
+        stacklevel=2,
+    )
     assert (
         emissions.ndim == 3
     ), "emissions should be 3D, of shape (num_batches, num_timesteps, emission_dim)"

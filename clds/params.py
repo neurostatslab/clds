@@ -5,6 +5,7 @@
 
 from jaxtyping import Array, Float, Union
 from typing import NamedTuple
+import warnings
 
 
 # %%
@@ -23,27 +24,7 @@ class ParamsNormalLikelihood(NamedTuple):
     scale_tril: Float[Array, "emission_dim emission_dim"]
 
 
-class ParamsGPLDS(NamedTuple):
-    emissions: ParamsEmission
-    likelihood: ParamsNormalLikelihood
-
-
 class ParamsCLDS(NamedTuple):
-    m0: Float[Array, "state_dim"]  # Accessed if 'm0' wgp prior is None
-    m0_gp_weights: Float[Array, "state_dim 1 len_basis"]
-    S0: Float[Array, "state_dim state_dim"]
-    dynamics_gp_weights: Float[Array, "state_dim state_dim len_basis"]
-    emissions_gp_weights: Float[Array, "emission_dim state_dim len_basis"]
-    Cs: Float[
-        Array, "num_timesteps emission_dim state_dim"
-    ]  # Accessed if 'C' wgp prior is None
-    bias_gp_weights: Float[Array, "state_dim 1 len_basis"]
-    bs: Float[Array, "num_timesteps state_dim"]  # Accessed if 'b' wgp prior is None
-    Q: Float[Array, "state_dim state_dim"]
-    R: Float[Array, "emission_dim emission_dim"]
-
-
-class ParamsCLDS2(NamedTuple):
     initial_mean: Union[
         Float[Array, "state_dim"], Float[Array, "state_dim 1 len_basis"]
     ]
@@ -66,3 +47,9 @@ class ParamsBasis(NamedTuple):
     A_weights: Float[Array, "state_dim state_dim len_basis"]
     b_weights: Float[Array, "state_dim state_dim len_basis"]
     L_weights: Float[Array, "state_dim state_dim len_basis"]
+
+def __getattr__(name):
+    if name == "ParamsCLDS2":
+        warnings.warn("ParamsCLDS2 has been renamed to ParamsCLDS.", DeprecationWarning, stacklevel=2)
+        return ParamsCLDS
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

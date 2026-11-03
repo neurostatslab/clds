@@ -26,7 +26,7 @@ def identifiability_transform(params):
 
 # %%
 def get_fixed_points(
-    model,
+    model: CLDS,
     params: ParamsCLDS,
     conditions_range: Float[Array, "T M"],
     ROTATE: bool = True,
@@ -38,9 +38,6 @@ def get_fixed_points(
         conditions_range: Float[Array, "T M"], the range of conditions to evaluate the fixed points
         ROTATE: bool, whether to rotate the latent space (chosen so that Q becomes identity)
     """
-    # assert model.wgps['A'] and model.wgps['b'], 'A and b priors are required'
-    # As_conditions = model.wgps['A'](params.dynamics_gp_weights, conditions_range)
-    # bs_conditions = model.wgps['b'](params.bias_gp_weights, conditions_range).squeeze()
     As_conditions, _, bs_conditions, _, _ = model.weights_to_params(
         params, conditions_range
     )
@@ -58,9 +55,6 @@ def get_fixed_points(
         )
     )(jnp.arange(len(conditions_range)))
 
-    # if model.fixed_point_func is not None:
-    #     fixed_points = model.fixed_point_func(conditions_range)
-
     return fixed_points
 
 def expected_latent_given_u(
@@ -73,7 +67,12 @@ def expected_latent_given_u(
     mask: Float[Array, "B T"], optional, valid (padded) time steps are True (False)
     '''
     if basis is None:
-        basis = model.priors["dynamics"].basis
+        if "A" in model.gp_priors:
+            basis = model.priors["A"].basis
+        elif "b" in model.gp_priors:
+            basis = model.priors["b"].basis
+        else:
+            raise ValueError
 
     E_x_given_u = WeightSpaceGaussianProcess(
                     basis=basis,
@@ -114,7 +113,14 @@ def expected_latent_given_u(
     return E_x_given_u, weights
 
 def get_regularized_fixed_points(
-        model, params, emissions, conditions, conditions_range, ROTATE=False, tau=0.1, mask=None,
+        model: CLDS,
+        params: ParamsCLDS,
+        emissions: Float[Array, "B T emission_dim"],
+        conditions: Float[Array, "B T M"],
+        conditions_range: Float[Array, "N M"],
+        ROTATE=True, 
+        tau=0.1, 
+        mask=None,
     ) -> tuple:
     """
     Compute fixed points of the system regularized (Tikhonov, Ridge) by their distances to anchors E[x|u],
@@ -139,7 +145,7 @@ def get_regularized_fixed_points(
         drift = A @ x + b - x
         return x, jnp.linalg.norm(drift), s.min()
 
-    assert model.use_dynamics_prior, "Fixed points are not a function of 'u'"
+    assert "A" in model.gp_priors or "b" in model.gp_priors, "Fixed points are not a function of 'u'"
     As, _, bs, _, _ = model.weights_to_params(
         params, conditions_range
     )
@@ -166,16 +172,15 @@ def get_regularized_fixed_points(
 def compute_composite_dynamics(
     model: CLDS,
     params: ParamsCLDS,
-    conditions_range: Float[Array, "N M"],
     emissions: Float[Array, "B T emission_dim"],
     conditions: Float[Array, "B T M"],
+    conditions_range: Float[Array, "N M"],
     ROTATE=True,
     n_bins=20,
     pad=1.0,
     x_lims=None,
     y_lims=None
 ):
-    # assert model.wgps['A'] and model.wgps['b'], 'A and b priors are required'
     assert model.state_dim == 2, "Only 2D latent space is supported"
 
     H, Hinv = identifiability_transform(params)
@@ -231,12 +236,10 @@ def compute_composite_dynamics(
             params, conditions[batch_id]
         )
         batch_bs = batch_bs[..., None]
-        # batch_As = model.wgps['A'](params.dynamics_gp_weights, conditions[batch_id])
         batch_As_rot = (
             jnp.einsum("ij,tjk,kl->til", H, batch_As, Hinv) if ROTATE else batch_As
         )
 
-        # batch_bs = model.wgps['b'](params.bias_gp_weights, conditions[batch_id])
         batch_bs_rot = jnp.einsum("ij,tjk->tik", H, batch_bs) if ROTATE else batch_bs
 
         # Estimate parameters and statistics per bin
