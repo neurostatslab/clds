@@ -126,7 +126,6 @@ dependencies = [
   "pynapple",
   "nemos",
   "mpmath",
-  "numpyro",
   "ipykernel",
 ]
 
@@ -149,11 +148,9 @@ dependencies = [
 #   "myst-nb",
 #   "pydata-sphinx-theme",
 # ]
-# dev = [
-#   "pytest",
-#   "black",
-#   "isort",
-# ]
+dev = [
+  "pytest",
+]
 
 # List URLs that are relevant to your project
 #
