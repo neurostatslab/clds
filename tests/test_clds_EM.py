@@ -386,7 +386,7 @@ def _regression_objectives(fitting_case, params, stats, block):
 
 
 def _evaluated(fitting_case, params, i):
-    A, C, b, d, m0 = fitting_case.model.weights_to_params(params, fitting_case.u[i])
+    A, C, b, d, m0 = fitting_case.model.params_to_coefficients(params, fitting_case.u[i])
     return dict(m0=m0, S0=params.initial_cov, As=A, Q=params.dynamics_cov,
                 bs=b, Cs=C, R=params.emissions_cov, ds=d, ys=fitting_case.y[i])
 

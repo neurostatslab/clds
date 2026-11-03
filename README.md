@@ -119,6 +119,9 @@ model = CLDS(
 
 # Fit the model. An optional mask has shape (B, T).
 params, (log_liks, _) = model.fit(emissions, conditions, num_iters=100)
+
+# Inspect fitted coefficients
+As, Cs, bs, _, _ = model.params_to_coefficients(params, time)
 ```
 
 For your own application, replace `emissions` with your observations and choose the latent dimension `D`. To model dependence on variables other than time, replace `conditions` with your covariates of shape `(B, T, M)` and choose a GP lengthscale appropriate to their scale.

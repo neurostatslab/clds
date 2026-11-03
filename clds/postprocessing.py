@@ -38,7 +38,7 @@ def get_fixed_points(
         conditions_range: Float[Array, "T M"], the range of conditions to evaluate the fixed points
         ROTATE: bool, whether to rotate the latent space (chosen so that Q becomes identity)
     """
-    As_conditions, _, bs_conditions, _, _ = model.weights_to_params(
+    As_conditions, _, bs_conditions, _, _ = model.params_to_coefficients(
         params, conditions_range
     )
 
@@ -146,7 +146,7 @@ def get_regularized_fixed_points(
         return x, jnp.linalg.norm(drift), s.min()
 
     assert "A" in model.gp_priors or "b" in model.gp_priors, "Fixed points are not a function of 'u'"
-    As, _, bs, _, _ = model.weights_to_params(
+    As, _, bs, _, _ = model.params_to_coefficients(
         params, conditions_range
     )
     if ROTATE:
@@ -232,7 +232,7 @@ def compute_composite_dynamics(
         x_smooth_rot = jnp.einsum("ij,tj->ti", H, x_smooth) if ROTATE else x_smooth
 
         # MAP estimates of As and bs
-        batch_As, _, batch_bs, _, _ = model.weights_to_params(
+        batch_As, _, batch_bs, _, _ = model.params_to_coefficients(
             params, conditions[batch_id]
         )
         batch_bs = batch_bs[..., None]

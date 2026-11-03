@@ -578,7 +578,7 @@ class CLDS:
         """
         if self.params is None:
             raise ValueError("Model parameters have not been fit. Call fit() first.")
-        As, Cs, bs, ds, m0 = self.weights_to_params(self.params, inputs)
+        As, Cs, bs, ds, m0 = self.params_to_coefficients(self.params, inputs)
         return self.run_dynamics(
             key,
             As,
@@ -602,7 +602,7 @@ class CLDS:
             start=0.0,
         )
 
-    def weights_to_params(self, params, inputs):
+    def params_to_coefficients(self, params, inputs):
         """Evaluate the coefficients at the conditions `inputs`: GP coefficients through
         their weight-space prior, static ones broadcast over time, disabled biases as zeros."""
 
@@ -624,7 +624,7 @@ class CLDS:
     def smoother(self, params: ParamsCLDS, emissions, inputs, mask=None):
         """inputs as conditions"""
         # Format params
-        As, Cs, bs, ds, m0 = self.weights_to_params(params, inputs)
+        As, Cs, bs, ds, m0 = self.params_to_coefficients(params, inputs)
         # Q = params.dynamics_cov
         # R = params.emissions_cov
 
