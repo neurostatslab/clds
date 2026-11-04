@@ -6,7 +6,17 @@ These models use Gaussian Process (GP) priors to capture the nonlinear dependenc
 Conditioned on these covariates, the data is modeled with linear dynamics. 
 This allows for transparent interpretation and tractable Bayesian inference. 
 
-This code package introduces the CLDS generative model, as well as example use cases. For more details, see our NeurIPS 2025 paper at https://openreview.net/forum?id=xgmMdTTzjj.
+This code package introduces the CLDS generative model, as well as example use cases. For more details, see our [NeurIPS 2025 paper](https://openreview.net/forum?id=xgmMdTTzjj).
+```
+@inproceedings{
+    geadah2025:CLDS,
+    title={Modeling Neural Activity with Conditionally Linear Dynamical Systems},
+    author={Victor Geadah and Amin Nejatbakhsh and David Lipshutz and Jonathan W. Pillow and Alex H Williams},
+    booktitle={The Thirty-ninth Annual Conference on Neural Information Processing Systems},
+    year={2025},
+    url={https://openreview.net/forum?id=xgmMdTTzjj}
+}
+```
 
 **Note:** This research code remains a work-in-progress to some extent. Please use at your own risk and reach out to us (vgeadah@flatironinstitute.org, awilliams@flatironinstitute.org) if you have questions.
 
@@ -40,24 +50,24 @@ respectively synthetic and real neural datasets.
 Requires Python >= 3.10. Dependencies are listed in [`pyproject.toml`](pyproject.toml).
 
 1. Clone the repository
-```
+```{.console}
 git clone https://github.com/neurostatslab/clds.git
 cd clds
 ```
 
 2. Create a **virtual environment** and activate it
-```
+```{.console}
 python -m venv .venv
 source .venv/bin/activate
 ```
 
 3. Install the package in editable mode, along with its requirements. To also add the dependencies for running the tests (pytest), run `pip install -e ".[dev]"` instead.
-```
+```{.console}
 pip install -e .
 ```
 
 4. (Optional) For GPU support (still in progress), install [**JAX**](https://docs.jax.dev/en/latest/installation.html) with CUDA, picking the version that matches your driver, e.g.
-```
+```{.console}
 pip install -U "jax[cuda13]"
 ```
 
@@ -69,11 +79,9 @@ Since the code is preliminary, you will be able to use `git pull` to get updates
 
 CLDS fits latent dynamics whose parameters vary with observed **conditions**, such as time, stimulus, or behavior. 
 Specifically, CLDS models responses $y_t \in \mathbb{R}^N$ as emissions from a latent time-varying linear dynamical system in $x_t \in \mathbb{R}^D$, with dynamics governed by the conditions $u_t \in \mathbb{R}^M$,
-$$
-x_{t+1} = A(u_t) x_t + b(u_t) + \epsilon_t
-\qquad
-y_t = C(u_t)x_t + d(u_t) + \omega_t
-$$
+
+$$x_{t+1} = A(u_t) x_t + b(u_t) + \epsilon_t \qquad y_t = C(u_t)x_t + d(u_t) + \omega_t$$
+
 over time steps $t \in \{1, \dots, T\}$ from initial condition $x_1 \sim \mathcal{N}(m(u_1), Q_1)$, and where $\epsilon_t \sim \mathcal{N}(0, Q)$ and $\omega_t \sim N (0, R)$ are sources of noise, i.i.d. in time. 
 
 To use and fit CLDS to your data, you need two arrays:
@@ -84,11 +92,9 @@ To use and fit CLDS to your data, you need two arrays:
 ### Example
 
 For our example, let us time as the single condition $u_t = t$ and fit
-$$
-x_{t+1} = A(t)x_t + b(t) + \epsilon_t,
-\qquad
-y_t = Cx_t + \omega_t.
-$$
+
+$$x_{t+1} = A(t)x_t + b(t) + \epsilon_t, \qquad y_t = Cx_t + \omega_t.$$
+
 We place GP priors on $A$ and $b$, allowing the dynamics to vary smoothly over time. The emission matrix $C$ is constant, and there is no emission bias.
 
 ```python
@@ -125,3 +131,4 @@ As, Cs, bs, _, _ = model.params_to_coefficients(params, time)
 ```
 
 For your own application, replace `emissions` with your observations and choose the latent dimension `D`. To model dependence on variables other than time, replace `conditions` with your covariates of shape `(B, T, M)` and choose a GP lengthscale appropriate to their scale.
+

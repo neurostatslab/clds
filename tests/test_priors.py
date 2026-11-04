@@ -21,11 +21,9 @@ def torus_basis_funcs(n_basis_funcs):
 @pytest.mark.parametrize("output_dim", [1, 2, 10])
 @pytest.mark.parametrize("include_bias", [True, False])
 class TestWeightSpaceGaussianProcess:
-
-    # def test_init(self):
     @pytest.fixture
     def instantiate_prior(
-        self, n_basis_funcs, input_dim, output_dim, include_bias, torus_basis_funcs
+        self, input_dim, output_dim, include_bias, torus_basis_funcs
     ):
         return WeightSpaceGaussianProcess(
             basis=torus_basis_funcs,
@@ -41,12 +39,12 @@ class TestWeightSpaceGaussianProcess:
         output_dim,
         include_bias,
         instantiate_prior,
-        torus_basis_funcs,
     ):
+        M_conditions = 1
         prior = instantiate_prior
         key = jxr.PRNGKey(0)
         weights = prior.sample_weights(key)
-        expected_shape = (prior.n_basis_funcs, output_dim, input_dim + include_bias)
+        expected_shape = ((2 * n_basis_funcs - 1) ** M_conditions, output_dim, input_dim + include_bias)
         assert (
             weights.shape == expected_shape
         ), f"Expected shape {expected_shape}, got {weights.shape}"
